@@ -45,24 +45,12 @@ uint128_t add_128_128(uint128_t a, uint128_t b)
     return l_result;
 }
 
-
-
-
-
 __kernel void vector_add(__global ulong *A, __global ulong *B, __global ulong *C, __global ulong *D) {
-    //ulong c[4];
-    uint128_t try;
-    try.m_low = A[0];
-    try.m_high = A[0];
     ulong l_carry = 0;
     int i;
     for(i=0; i<4; ++i)
     {
-    	ulong l_sum;
-    	if (i==0)
-        	l_sum = adding(try.m_low, B[i], l_carry);
-        else
-        	l_sum = adding(A[i], B[i], l_carry);
+    	ulong l_sum = adding(A[i], B[i], l_carry);
         if(l_sum != A[i]) {
             l_carry = (l_sum < A[i]);
         }
@@ -71,6 +59,8 @@ __kernel void vector_add(__global ulong *A, __global ulong *B, __global ulong *C
     
    D[0] = l_carry;
 }
+
+
 
 __kernel void vector_sub(__global ulong *A, __global ulong *B, __global ulong *C, __global ulong *D) {
     //ulong c[4];
@@ -83,10 +73,6 @@ __kernel void vector_sub(__global ulong *A, __global ulong *B, __global ulong *C
             l_borrow = (l_diff > A[i]);
         C[i] = l_diff;
     }
-    //for(i=0; i<4; ++i)
-    //{
-    	//C[i] = c[i];
-    //}
     D[0] = l_borrow;
 }
 
@@ -120,5 +106,164 @@ __kernel void vli_mult(__global ulong *p_result, __global ulong *p_left, __globa
     }
     
     p_result[4*2 - 1] = r01.m_low;
+}
+
+
+global void vli_set(global ulong *p_dest,global ulong *p_src)
+{
+    uint i;
+    for(i=0; i<4; ++i)
+        p_dest[i] = p_src[i];
+}
+
+ulong vli_lshift(ulong *p_result,ulong *p_in, uint p_shift)
+{
+    ulong l_carry = 0;
+    uint i;
+    for(i = 0; i < 4; ++i)
+    {
+        ulong l_temp = p_in[i];
+        p_result[i] = (l_temp << p_shift) | l_carry;
+        l_carry = l_temp >> (64 - p_shift);
+    }
+    
+    return l_carry;
+}
+
+inline ulong vli_add(global ulong *p_result, global ulong *p_left, ulong *p_right)
+{
+    ulong l_carry = 0;
+    uint i;
+    for(i=0; i<4; ++i)
+    {
+        ulong l_sum = p_left[i] + p_right[i] + l_carry;
+        if(l_sum != p_left[i])
+        {
+            l_carry = (l_sum < p_left[i]);
+        }
+        p_result[i] = l_sum;
+    }
+    return l_carry;
+}
+
+inline ulong vli_sub(global ulong *p_result, global ulong *p_left, ulong *p_right)
+{
+    ulong l_borrow = 0;
+    uint i;
+    for(i=0; i<4; ++i)
+    {
+        ulong l_diff = p_left[i] - p_right[i] - l_borrow;
+        if(l_diff != p_left[i])
+        {
+            l_borrow = (l_diff > p_left[i]);
+        }
+        p_result[i] = l_diff;
+    }
+    return l_borrow;
+}
+
+int vli_cmp(ulong *p_left, global ulong *p_right)
+{
+    int i;
+    for(i = 4-1; i >= 0; --i)
+    {
+        if(p_left[i] > p_right[i])
+        {
+            return 1;
+        }
+        else if(p_left[i] < p_right[i])
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+
+__kernel void mmod_fast(__global ulong *p_result,__global ulong *p_product)
+{
+    ulong l_tmp[4];
+    int l_carry;
+    
+    // t 
+    vli_set(p_result, p_product);
+    
+    // s1 
+    l_tmp[0] = 0;
+    l_tmp[1] = p_product[5] & 0xffffffff00000000UL;
+    l_tmp[2] = p_product[6];
+    l_tmp[3] = p_product[7];
+    l_carry = vli_lshift(l_tmp, l_tmp, 1);
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    // s2 
+    l_tmp[1] = p_product[6] << 32;
+    l_tmp[2] = (p_product[6] >> 32) | (p_product[7] << 32);
+    l_tmp[3] = p_product[7] >> 32;
+    l_carry += vli_lshift(l_tmp, l_tmp, 1);
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    // s3 
+    l_tmp[0] = p_product[4];
+    l_tmp[1] = p_product[5] & 0xffffffff;
+    l_tmp[2] = 0;
+    l_tmp[3] = p_product[7];
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    // s4 
+    l_tmp[0] = (p_product[4] >> 32) | (p_product[5] << 32);
+    l_tmp[1] = (p_product[5] >> 32) | (p_product[6] & 0xffffffff00000000UL);
+    l_tmp[2] = p_product[7];
+    l_tmp[3] = (p_product[6] >> 32) | (p_product[4] << 32);
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    // d1 
+    l_tmp[0] = (p_product[5] >> 32) | (p_product[6] << 32);
+    l_tmp[1] = (p_product[6] >> 32);
+    l_tmp[2] = 0;
+    l_tmp[3] = (p_product[4] & 0xffffffff) | (p_product[5] << 32);
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    // d2 
+    l_tmp[0] = p_product[6];
+    l_tmp[1] = p_product[7];
+    l_tmp[2] = 0;
+    l_tmp[3] = (p_product[4] >> 32) | (p_product[5] & 0xffffffff00000000UL);
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    //d3 
+    l_tmp[0] = (p_product[6] >> 32) | (p_product[7] << 32);
+    l_tmp[1] = (p_product[7] >> 32) | (p_product[4] << 32);
+    l_tmp[2] = (p_product[4] >> 32) | (p_product[5] << 32);
+    l_tmp[3] = (p_product[6] << 32);
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    //d4 
+    l_tmp[0] = p_product[7];
+    l_tmp[1] = p_product[4] & 0xffffffff00000000UL;
+    l_tmp[2] = p_product[5];
+    l_tmp[3] = p_product[6] & 0xffffffff00000000UL;
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    ulong curve_p[4];
+    curve_p[0] = 0xffffffffffffffffUL;
+    curve_p[1] = 0x00000000ffffffffUL;
+    curve_p[2] = 0x0000000000000000UL;
+    curve_p[3] = 0xffffffff00000001UL;  
+    
+    if(l_carry < 0)
+    {
+        while(l_carry < 0)
+        {
+            l_carry += vli_add(p_result, p_result, curve_p); //TODO: last arg is curve_p its fix num now
+        } 
+    }
+    else
+    {
+        while(l_carry || vli_cmp(curve_p, p_result) != 1) //TODO: first arg is curve_p its fix num now
+        {
+            l_carry -= vli_sub(p_result, p_result, curve_p); //TODO: last arg is curve_p its fix num now
+        }
+    }
 }
 

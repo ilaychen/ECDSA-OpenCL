@@ -1063,7 +1063,115 @@ static void vli_modMult_fast(uint64_t *p_result, uint64_t *p_left, uint64_t *p_r
     for(int j=0;j<8;j++)
 		  printf(" %d",l_productC[j]);
 	 printf("\n");
-    vli_mmod_fast(p_result, l_product);
+   
+   
+   
+   
+   
+   /////////////
+    //OpenCL Shit
+    /////////////
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 	//(__global ulong *p_result, __global ulong *p_left, __global ulong *p_right)
+ 	//vli_mult(l_productC, p_left, p_right);
+    // Create memory buffers on the device for each vector 
+    a_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            2*LIST_SIZE * sizeof(ulong), NULL, &ret);
+    b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            2*LIST_SIZE * sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            2*LIST_SIZE * sizeof(ulong), p_result, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            2*LIST_SIZE * sizeof(ulong), l_product, 0, NULL, NULL);
+ 
+    // Create a program from the kernel source
+    program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    size_t len;
+	char buffer[2048];
+	for(int ntm = 0; ntm<2048;ntm++) buffer[ntm] = 0;
+	clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
+	for(int ntm = 0; ntm<2048;ntm++) printf("%c", buffer[ntm]);
+ 	
+    // Create the OpenCL kernel
+    kernel = clCreateKernel(program, "mmod_fast", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    ret = clEnqueueReadBuffer(command_queue, a_mem_obj, CL_TRUE, 0, 
+              2*LIST_SIZE * sizeof(ulong), p_result, 0, NULL, NULL);
+	
+    // Clean up
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    
+    /////////////
+    //C Shit
+    /////////////
+    uint64_t res2[2 * NUM_ECC_DIGITS];
+    vli_mmod_fast(res2, l_product);
+    
+    
+    /////////////
+    //COmpare
+    /////////////
+
+	for(i=0;i<8;i++) {
+		if(res2[i]!=p_result[i])
+  		{
+      		i=-1;
+	    	printf("\n~~~BBAADD~~~");
+      		break;
+   		}
+	}
+
+	if(i!=-1)
+  		printf("\n~~~GOOODDD~~~");
+  
+    printf("\n---MMOD FAST---");
+	  printf("\nprod - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",l_product[j]);
+    printf("\nG - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",p_result[j]);
+    printf("\nC - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",res2[j]);
+	 printf("\n");
 }
 
 /* Computes p_result = p_left^2 % curve_p. */
