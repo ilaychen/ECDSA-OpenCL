@@ -1,0 +1,2090 @@
+#include <stdio.h>
+#include <stdlib.h> 
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
+#include <CL/cl.h>
+#endif
+
+#define secp128r1 16
+#define secp192r1 24
+#define secp256r1 32
+#define secp384r1 48
+#ifndef ECC_CURVE
+    #define ECC_CURVE secp256r1
+#endif
+
+#define MAX_SOURCE_SIZE (0x100000)
+
+#include "ecc.h"
+#include <inttypes.h>
+#include <string.h>
+#include <time.h>
+
+#define NUM_ECC_DIGITS (ECC_BYTES/8)
+#define MAX_TRIES 16
+
+typedef unsigned int uint;
+
+#if defined(__SIZEOF_INT128__) || ((__clang_major__ * 100 + __clang_minor__) >= 302)
+    #define SUPPORTS_INT128 1
+#else
+    #define SUPPORTS_INT128 0
+#endif
+
+typedef struct
+{
+    uint64_t m_low;
+    uint64_t m_high;
+} uint128_t;
+
+typedef struct EccPoint
+{
+    uint64_t x[NUM_ECC_DIGITS];
+    uint64_t y[NUM_ECC_DIGITS];
+} EccPoint;
+
+#define CONCAT1(a, b) a##b
+#define CONCAT(a, b) CONCAT1(a, b)
+
+#define Curve_P_16 {0xFFFFFFFFFFFFFFFF, 0xFFFFFFFDFFFFFFFF}
+#define Curve_P_24 {0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFEull, 0xFFFFFFFFFFFFFFFFull}
+#define Curve_P_32 {0xFFFFFFFFFFFFFFFFull, 0x00000000FFFFFFFFull, 0x0000000000000000ull, 0xFFFFFFFF00000001ull}
+#define Curve_P_48 {0x00000000FFFFFFFF, 0xFFFFFFFF00000000, 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF}
+
+#define Curve_B_16 {0xD824993C2CEE5ED3, 0xE87579C11079F43D}
+#define Curve_B_24 {0xFEB8DEECC146B9B1ull, 0x0FA7E9AB72243049ull, 0x64210519E59C80E7ull}
+#define Curve_B_32 {0x3BCE3C3E27D2604Bull, 0x651D06B0CC53B0F6ull, 0xB3EBBD55769886BCull, 0x5AC635D8AA3A93E7ull}
+#define Curve_B_48 {0x2A85C8EDD3EC2AEF, 0xC656398D8A2ED19D, 0x0314088F5013875A, 0x181D9C6EFE814112, 0x988E056BE3F82D19, 0xB3312FA7E23EE7E4}
+
+#define Curve_G_16 { \
+    {0x0C28607CA52C5B86, 0x161FF7528B899B2D}, \
+    {0xC02DA292DDED7A83, 0xCF5AC8395BAFEB13}}
+
+#define Curve_G_24 { \
+    {0xF4FF0AFD82FF1012ull, 0x7CBF20EB43A18800ull, 0x188DA80EB03090F6ull}, \
+    {0x73F977A11E794811ull, 0x631011ED6B24CDD5ull, 0x07192B95FFC8DA78ull}}
+    //04 6B17D1F2 E12C4247 F8BCE6E5 63A440F2 77037D81 2DEB33A0F4A13945 D898C296     4FE342E2 FE1A7F9B 8EE7EB4A 7C0F9E16 2BCE33576B315ECE CBB64068 37BF51F5
+#define Curve_G_32 { \
+    {0xF4A13945D898C296ull, 0x77037D812DEB33A0ull, 0xF8BCE6E563A440F2ull, 0x6B17D1F2E12C4247ull}, \
+    {0xCBB6406837BF51F5ull, 0x2BCE33576B315ECEull, 0x8EE7EB4A7C0F9E16ull, 0x4FE342E2FE1A7F9Bull}}
+
+#define Curve_G_48 { \
+    {0x3A545E3872760AB7, 0x5502F25DBF55296C, 0x59F741E082542A38, 0x6E1D3B628BA79B98, 0x8EB1C71EF320AD74, 0xAA87CA22BE8B0537}, \
+    {0x7A431D7C90EA0E5F, 0x0A60B1CE1D7E819D, 0xE9DA3113B5F0B8C0, 0xF8F41DBD289A147C, 0x5D9E98BF9292DC29, 0x3617DE4A96262C6F}}
+
+#define Curve_N_16 {0x75A30D1B9038A115, 0xFFFFFFFE00000000}
+#define Curve_N_24 {0x146BC9B1B4D22831ull, 0xFFFFFFFF99DEF836ull, 0xFFFFFFFFFFFFFFFFull}
+#define Curve_N_32 {0xF3B9CAC2FC632551ull, 0xBCE6FAADA7179E84ull, 0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFF00000000ull}
+#define Curve_N_48 {0xECEC196ACCC52973, 0x581A0DB248B0A77A, 0xC7634D81F4372DDF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF}
+
+static uint64_t curve_p[NUM_ECC_DIGITS] = CONCAT(Curve_P_, ECC_CURVE);
+static uint64_t curve_b[NUM_ECC_DIGITS] = CONCAT(Curve_B_, ECC_CURVE);
+static EccPoint curve_G = CONCAT(Curve_G_, ECC_CURVE);
+static uint64_t curve_n[NUM_ECC_DIGITS] = CONCAT(Curve_N_, ECC_CURVE);
+
+#if (defined(_WIN32) || defined(_WIN64))
+/* Windows */
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <wincrypt.h>
+
+static int getRandomNumber(uint64_t *p_vli)
+{
+    HCRYPTPROV l_prov;
+    if(!CryptAcquireContext(&l_prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+    {
+        return 0;
+    }
+
+    CryptGenRandom(l_prov, ECC_BYTES, (BYTE *)p_vli);
+    CryptReleaseContext(l_prov, 0);
+    
+    return 1;
+}
+
+#else /* _WIN32 */
+
+/* Assume that we are using a POSIX-like system with /dev/urandom or /dev/random. */
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#ifndef O_CLOEXEC
+    #define O_CLOEXEC 0
+#endif
+
+static int getRandomNumber(uint64_t *p_vli)
+{
+    int l_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if(l_fd == -1)
+    {
+        l_fd = open("/dev/random", O_RDONLY | O_CLOEXEC);
+        if(l_fd == -1)
+        {
+            return 0;
+        }
+   
+    }
+    
+    char *l_ptr = (char *)p_vli;
+    size_t l_left = ECC_BYTES;
+    while(l_left > 0)
+    {
+        int l_read = read(l_fd, l_ptr, l_left);
+        if(l_read <= 0)
+        { // read failed
+            close(l_fd);
+            return 0;
+        }
+        l_left -= l_read;
+        l_ptr += l_read;
+    }
+    
+    close(l_fd);
+    return 1;
+}
+
+#endif /* _WIN32 */
+
+static void vli_clear(uint64_t *p_vli)
+{
+    uint i;
+    for(i=0; i<NUM_ECC_DIGITS; ++i)
+    {
+        p_vli[i] = 0;
+    }
+}
+
+/* Returns 1 if p_vli == 0, 0 otherwise. */
+static int vli_isZero(uint64_t *p_vli)
+{
+    uint i;
+    for(i = 0; i < NUM_ECC_DIGITS; ++i)
+    {
+        if(p_vli[i])
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Returns nonzero if bit p_bit of p_vli is set. */
+static uint64_t vli_testBit(uint64_t *p_vli, uint p_bit)
+{
+    return (p_vli[p_bit/64] & ((uint64_t)1 << (p_bit % 64)));
+}
+
+/* Counts the number of 64-bit "digits" in p_vli. */
+static uint vli_numDigits(uint64_t *p_vli)
+{
+    int i;
+    /* Search from the end until we find a non-zero digit.
+       We do it in reverse because we expect that most digits will be nonzero. */
+    for(i = NUM_ECC_DIGITS - 1; i >= 0 && p_vli[i] == 0; --i)
+    {
+    }
+
+    return (i + 1);
+}
+
+/* Counts the number of bits required for p_vli. */
+static uint vli_numBits(uint64_t *p_vli)
+{
+    uint i;
+    uint64_t l_digit;
+    
+    uint l_numDigits = vli_numDigits(p_vli);
+    if(l_numDigits == 0)
+    {
+        return 0;
+    }
+
+    l_digit = p_vli[l_numDigits - 1];
+    for(i=0; l_digit; ++i)
+    {
+        l_digit >>= 1;
+    }
+    
+    return ((l_numDigits - 1) * 64 + i);
+}
+
+/* Sets p_dest = p_src. */
+static void vli_set(uint64_t *p_dest, uint64_t *p_src)
+{
+    uint i;
+    for(i=0; i<NUM_ECC_DIGITS; ++i)
+    {
+        p_dest[i] = p_src[i];
+    }
+}
+
+/* Returns sign of p_left - p_right. */
+static int vli_cmp(uint64_t *p_left, uint64_t *p_right)
+{
+    int i;
+    for(i = NUM_ECC_DIGITS-1; i >= 0; --i)
+    {
+        if(p_left[i] > p_right[i])
+        {
+            return 1;
+        }
+        else if(p_left[i] < p_right[i])
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Computes p_result = p_in << c, returning carry. Can modify in place (if p_result == p_in). 0 < p_shift < 64. */
+static uint64_t vli_lshift(uint64_t *p_result, uint64_t *p_in, uint p_shift)
+{
+    uint64_t l_carry = 0;
+    uint i;
+    for(i = 0; i < NUM_ECC_DIGITS; ++i)
+    {
+        uint64_t l_temp = p_in[i];
+        p_result[i] = (l_temp << p_shift) | l_carry;
+        l_carry = l_temp >> (64 - p_shift);
+    }
+    
+    return l_carry;
+}
+
+/* Computes p_vli = p_vli >> 1. */
+static void vli_rshift1(uint64_t *p_vli)
+{
+    uint64_t *l_end = p_vli;
+    uint64_t l_carry = 0;
+    
+    p_vli += NUM_ECC_DIGITS;
+    while(p_vli-- > l_end)
+    {
+        uint64_t l_temp = *p_vli;
+        *p_vli = (l_temp >> 1) | l_carry;
+        l_carry = l_temp << 63;
+    }
+}
+
+/* Computes p_result = p_left + p_right, returning carry. Can modify in place. */
+static uint64_t vli_add(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right)
+{
+    uint64_t l_carry = 0;
+    uint i;
+    for(i=0; i<NUM_ECC_DIGITS; ++i)
+    {
+        uint64_t l_sum = p_left[i] + p_right[i] + l_carry;
+        if(l_sum != p_left[i])
+        {
+            l_carry = (l_sum < p_left[i]);
+        }
+        p_result[i] = l_sum;
+    }
+    return l_carry;
+}
+
+/* Computes p_result = p_left - p_right, returning borrow. Can modify in place. */
+static uint64_t vli_sub(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right)
+{
+    uint64_t l_borrow = 0;
+    uint i;
+    for(i=0; i<NUM_ECC_DIGITS; ++i)
+    {
+        uint64_t l_diff = p_left[i] - p_right[i] - l_borrow;
+        if(l_diff != p_left[i])
+        {
+            l_borrow = (l_diff > p_left[i]);
+        }
+        p_result[i] = l_diff;
+    }
+    return l_borrow;
+}
+
+
+static uint128_t mul_64_64(uint64_t p_left, uint64_t p_right)
+{
+    uint128_t l_result;
+    
+    uint64_t a0 = p_left & 0xffffffffull;
+    uint64_t a1 = p_left >> 32;
+    uint64_t b0 = p_right & 0xffffffffull;
+    uint64_t b1 = p_right >> 32;
+    
+    uint64_t m0 = a0 * b0;
+    uint64_t m1 = a0 * b1;
+    uint64_t m2 = a1 * b0;
+    uint64_t m3 = a1 * b1;
+    
+    m2 += (m0 >> 32);
+    m2 += m1;
+    if(m2 < m1)
+    { // overflow
+        m3 += 0x100000000ull;
+    }
+    
+    l_result.m_low = (m0 & 0xffffffffull) | (m2 << 32);
+    l_result.m_high = m3 + (m2 >> 32);
+    
+    return l_result;
+}
+
+static uint128_t add_128_128(uint128_t a, uint128_t b)
+{
+    uint128_t l_result;
+    l_result.m_low = a.m_low + b.m_low;
+    l_result.m_high = a.m_high + b.m_high + (l_result.m_low < a.m_low);
+    return l_result;
+}
+
+static void vli_mult(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right)
+{
+    uint128_t r01 = {0, 0};
+    uint64_t r2 = 0;
+    
+    uint i, k;
+    
+    /* Compute each digit of p_result in sequence, maintaining the carries. */
+    for(k=0; k < NUM_ECC_DIGITS*2 - 1; ++k)
+    {
+        uint l_min = (k < NUM_ECC_DIGITS ? 0 : (k + 1) - NUM_ECC_DIGITS);
+        for(i=l_min; i<=k && i<NUM_ECC_DIGITS; ++i)
+        {
+            uint128_t l_product = mul_64_64(p_left[i], p_right[k-i]);
+            r01 = add_128_128(r01, l_product);
+            r2 += (r01.m_high < l_product.m_high);
+        }
+        p_result[k] = r01.m_low;
+        r01.m_low = r01.m_high;
+        r01.m_high = r2;
+        r2 = 0;
+    }
+    
+    p_result[NUM_ECC_DIGITS*2 - 1] = r01.m_low;
+}
+
+static void vli_square(uint64_t *p_result, uint64_t *p_left)
+{
+    uint128_t r01 = {0, 0};
+    uint64_t r2 = 0;
+    
+    uint i, k;
+    for(k=0; k < NUM_ECC_DIGITS*2 - 1; ++k)
+    {
+        uint l_min = (k < NUM_ECC_DIGITS ? 0 : (k + 1) - NUM_ECC_DIGITS);
+        for(i=l_min; i<=k && i<=k-i; ++i)
+        {
+            uint128_t l_product = mul_64_64(p_left[i], p_left[k-i]);
+            if(i < k-i)
+            {
+                r2 += l_product.m_high >> 63;
+                l_product.m_high = (l_product.m_high << 1) | (l_product.m_low >> 63);
+                l_product.m_low <<= 1;
+            }
+            r01 = add_128_128(r01, l_product);
+            r2 += (r01.m_high < l_product.m_high);
+        }
+        p_result[k] = r01.m_low;
+        r01.m_low = r01.m_high;
+        r01.m_high = r2;
+        r2 = 0;
+    }
+    
+    p_result[NUM_ECC_DIGITS*2 - 1] = r01.m_low;
+}
+
+
+
+/* Computes p_result = (p_left + p_right) % p_mod.
+   Assumes that p_left < p_mod and p_right < p_mod, p_result != p_mod. */
+
+
+static void vli_modAddC(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+    uint64_t l_carry = vli_add(p_result, p_left, p_right);
+    if(l_carry || vli_cmp(p_result, p_mod) >= 0)
+    { 
+        vli_sub(p_result, p_result, p_mod);
+    }
+}
+
+static void vli_modAddG(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+	//uint64_t l_carry = vli_add(p_result, p_left, p_right);
+	// Load the kernel source code into the array source_str
+	const int LIST_SIZE = 4;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+ 	uint64_t *A = p_left;
+	uint64_t *B = p_right;
+	uint64_t l_carry;
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 
+    // Create memory buffers on the device for each vector 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            		sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            LIST_SIZE * sizeof(ulong), A, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), B, 0, NULL, NULL);
+ 
+    // Create a program from the kernel source
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+ 
+    // Create the OpenCL kernel
+    cl_kernel kernel = clCreateKernel(program, "vector_add", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
+    ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&d_mem_obj);
+ 
+    // Execute the OpenCL kernel on the list
+    size_t global_item_size = LIST_SIZE; // Process the entire lists
+    size_t local_item_size = 1; // Divide work items into groups of 64
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    // Read the memory buffer C on the device to the local variable C
+    ulong *C = (ulong*)malloc(sizeof(ulong)*LIST_SIZE);
+    ulong *D = (ulong*)malloc(sizeof(ulong));
+    ret = clEnqueueReadBuffer(command_queue, c_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), C, 0, NULL, NULL);
+    ret = clEnqueueReadBuffer(command_queue, d_mem_obj, CL_TRUE, 0, 
+            		sizeof(ulong), D, 0, NULL, NULL);
+ 
+	for(int i=0;i<LIST_SIZE;i++)
+    		p_result[i] = C[i];
+    l_carry = *D;
+	
+    // Clean up
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseMemObject(c_mem_obj);
+    ret = clReleaseMemObject(d_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    if(l_carry || vli_cmp(p_result, p_mod) >= 0)
+    { 
+        vli_sub(p_result, p_result, p_mod);
+    }
+}
+
+static void vli_modAdd(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+uint64_t *p_result1 =  (uint64_t*)malloc(sizeof(uint64_t)*4);
+uint64_t *p_resultG =  (uint64_t*)malloc(sizeof(uint64_t)*4); 
+//vli_modAddG(p_resultG, p_left, p_right, p_mod);
+vli_modAddC(p_result, p_left, p_right, p_mod);
+/*int i;
+for(i=0;i<4;i++) {
+	if(p_result1[i]!=p_resultG[i])
+  	{
+      i=-1;
+	    printf("\n~~~BBAADD~~~");
+	        printf("\n---ADD---");
+    printf("\nLEFT - ");
+	  for(int j=0;j<4;j++)
+		  printf(" %d",p_left[j]);
+    printf("\nRIGHT- ");
+	  for(int j=0;j<4;j++)
+		  printf(" %d",p_right[j]);
+    printf("\nG - ");
+	  for(int j=0;j<4;j++)
+		  printf(" %d",p_resultG[j]);
+    printf("\nC - ");
+    for(int j=0;j<4;j++)
+		  printf(" %d",p_result1[j]);
+      break;
+   	}
+}
+
+free(p_result1);
+for(int j=0;j<4;j++)
+	p_result[j] = p_resultG[j];
+free(p_resultG);*/
+
+}
+
+/* Computes p_result = (p_left - p_right) % p_mod.
+   Assumes that p_left < p_mod and p_right < p_mod, p_result != p_mod. */
+static void vli_modSubC(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+    uint64_t l_borrow = vli_sub(p_result, p_left, p_right);
+    if(l_borrow)
+    { /* In this case, p_result == -diff == (max int) - diff.
+         Since -x % d == d - x, we can get the correct result from p_result + p_mod (with overflow). */
+        vli_add(p_result, p_result, p_mod);
+    }
+}
+
+static void vli_modSubG(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+	//uint64_t l_carry = vli_add(p_result, p_left, p_right);
+	// Load the kernel source code into the array source_str
+	const int LIST_SIZE = 4;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+ 	uint64_t *A = p_left;
+	uint64_t *B = p_right;
+	uint64_t l_carry;
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 
+    // Create memory buffers on the device for each vector 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            		sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            LIST_SIZE * sizeof(ulong), A, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), B, 0, NULL, NULL);
+ 
+    // Create a program from the kernel source
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+ 
+    // Create the OpenCL kernel
+    cl_kernel kernel = clCreateKernel(program, "vector_sub", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
+    ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&d_mem_obj);
+ 
+    // Execute the OpenCL kernel on the list
+    size_t global_item_size = LIST_SIZE; // Process the entire lists
+    size_t local_item_size = 1; // Divide work items into groups of 64
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    // Read the memory buffer C on the device to the local variable C
+    uint64_t *C = (uint64_t*)malloc(sizeof(uint64_t)*LIST_SIZE);
+    uint64_t *D = (uint64_t*)malloc(sizeof(uint64_t));
+    ret = clEnqueueReadBuffer(command_queue, c_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), C, 0, NULL, NULL);
+    ret = clEnqueueReadBuffer(command_queue, d_mem_obj, CL_TRUE, 0, 
+            		sizeof(ulong), D, 0, NULL, NULL);
+ 
+    // Display the result to the screen
+  //  for(int i = 0; i < LIST_SIZE; i++)
+     //   printf("\n%d + %d = %d\n", A[i], B[i], C[i]);
+	for(int i=0;i<LIST_SIZE;i++)
+    		p_result[i] = C[i];
+    l_carry = *D;
+	
+    // Clean up
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseMemObject(c_mem_obj);
+    ret = clReleaseMemObject(d_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    if(l_carry || vli_cmp(p_result, p_mod) >= 0)
+    { 
+        vli_add(p_result, p_result, p_mod);
+    }
+    //printf("\nopencl carry %d", l_carry);
+}
+
+static void vli_modSub(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+uint64_t *p_result1 =  (uint64_t*)malloc(sizeof(uint64_t)*4);
+uint64_t *p_resultG =  (uint64_t*)malloc(sizeof(uint64_t)*4); 
+//vli_modSubG(p_resultG, p_left, p_right, p_mod);
+vli_modSubC(p_result, p_left, p_right, p_mod);
+int i;
+/*for(i=0;i<4;i++) {
+	if(p_result1[i]!=p_resultG[i])
+  {
+      i=1;
+	    printf("\n~~~BBAADD~~~");
+      break;
+  }
+}
+if(i==4)
+  printf("\n~~~GOOODDD~~~");
+  
+    printf("\n---SUB---");
+    printf("\nLEFT - ");
+	  for(int j=0;j<4;j++)
+		  printf("%d",p_left[j]);
+    printf("\nRIGHT- ");
+	  for(int j=0;j<4;j++)
+		  printf("%d",p_right[j]);
+    printf("\nG - ");
+	  for(int j=0;j<4;j++)
+		  printf("%d",p_resultG[j]);
+    printf("\nC - ");
+    for(int j=0;j<4;j++)
+		  printf("%d",p_result1[j]);
+free(p_result1);
+for(int j=0;j<4;j++)
+	p_result[j] = p_resultG[j];
+free(p_resultG);*/
+
+}
+
+
+/* Computes p_result = p_product % curve_p
+   from http://www.nsa.gov/ia/_files/nist-routines.pdf */
+static void vli_mmod_fast(uint64_t *p_result, uint64_t *p_product)
+{
+    uint64_t l_tmp[NUM_ECC_DIGITS];
+    int l_carry;
+    
+    /* t */
+    vli_set(p_result, p_product);
+    
+    /* s1 */
+    l_tmp[0] = 0;
+    l_tmp[1] = p_product[5] & 0xffffffff00000000ull;
+    l_tmp[2] = p_product[6];
+    l_tmp[3] = p_product[7];
+    l_carry = vli_lshift(l_tmp, l_tmp, 1);
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    /* s2 */
+    l_tmp[1] = p_product[6] << 32;
+    l_tmp[2] = (p_product[6] >> 32) | (p_product[7] << 32);
+    l_tmp[3] = p_product[7] >> 32;
+    l_carry += vli_lshift(l_tmp, l_tmp, 1);
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    /* s3 */
+    l_tmp[0] = p_product[4];
+    l_tmp[1] = p_product[5] & 0xffffffff;
+    l_tmp[2] = 0;
+    l_tmp[3] = p_product[7];
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    /* s4 */
+    l_tmp[0] = (p_product[4] >> 32) | (p_product[5] << 32);
+    l_tmp[1] = (p_product[5] >> 32) | (p_product[6] & 0xffffffff00000000ull);
+    l_tmp[2] = p_product[7];
+    l_tmp[3] = (p_product[6] >> 32) | (p_product[4] << 32);
+    l_carry += vli_add(p_result, p_result, l_tmp);
+    
+    /* d1 */
+    l_tmp[0] = (p_product[5] >> 32) | (p_product[6] << 32);
+    l_tmp[1] = (p_product[6] >> 32);
+    l_tmp[2] = 0;
+    l_tmp[3] = (p_product[4] & 0xffffffff) | (p_product[5] << 32);
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    /* d2 */
+    l_tmp[0] = p_product[6];
+    l_tmp[1] = p_product[7];
+    l_tmp[2] = 0;
+    l_tmp[3] = (p_product[4] >> 32) | (p_product[5] & 0xffffffff00000000ull);
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    /* d3 */
+    l_tmp[0] = (p_product[6] >> 32) | (p_product[7] << 32);
+    l_tmp[1] = (p_product[7] >> 32) | (p_product[4] << 32);
+    l_tmp[2] = (p_product[4] >> 32) | (p_product[5] << 32);
+    l_tmp[3] = (p_product[6] << 32);
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    /* d4 */
+    l_tmp[0] = p_product[7];
+    l_tmp[1] = p_product[4] & 0xffffffff00000000ull;
+    l_tmp[2] = p_product[5];
+    l_tmp[3] = p_product[6] & 0xffffffff00000000ull;
+    l_carry -= vli_sub(p_result, p_result, l_tmp);
+    
+    if(l_carry < 0)
+    {
+        do
+        {
+            l_carry += vli_add(p_result, p_result, curve_p);
+        } while(l_carry < 0);
+    }
+    else
+    {
+        while(l_carry || vli_cmp(curve_p, p_result) != 1)
+        {
+            l_carry -= vli_sub(p_result, p_result, curve_p);
+        }
+    }
+}
+
+/* Computes p_result = (p_left * p_right) % curve_p. */
+static void vli_modMult_fastC(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right)
+{
+    uint64_t l_product[2 * NUM_ECC_DIGITS];
+    vli_mult(l_product, p_left, p_right);
+    vli_mmod_fast(p_result, l_product);
+}
+
+/* Computes p_result = (p_left * p_right) % curve_p. */
+static void vli_modMult_fastG(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right)
+{
+    uint64_t l_product[2 * NUM_ECC_DIGITS];
+    vli_mult(l_product, p_left, p_right);
+    vli_mmod_fast(p_result, l_product);
+}
+
+
+/* Computes p_result = (p_left * p_right) % curve_p. */
+static void vli_modMult_fast(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right)
+{
+	
+	const int LIST_SIZE = 4;
+	uint64_t *p_result1 = malloc(LIST_SIZE*sizeof(uint64_t));
+	uint64_t *p_result2 = malloc(LIST_SIZE*sizeof(uint64_t));
+	vli_modMult_fastG(p_result1,  p_left,  p_right);
+	vli_modMult_fastC(p_result2, p_left, p_right);
+	
+	for(int i = 0; i<LIST_SIZE; i++){
+		if(p_result1[i] != p_result2[i]) printf("PROBLEM vli_modMult_fast");
+	}
+	
+	for(int i = 0; i<LIST_SIZE; i++){
+		p_result[i] = p_result1[i]; 
+	}
+	free(p_result1);
+	free(p_result2);
+   /* uint64_t l_product[2 * NUM_ECC_DIGITS];
+    uint64_t l_productC[2 * NUM_ECC_DIGITS];
+    /////////////
+    //OpenCL Shit
+    /////////////
+    const int LIST_SIZE = 4;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+ 	uint64_t *A = p_left;
+	uint64_t *B = p_right;
+	uint64_t l_carry;
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 	//(__global ulong *p_result, __global ulong *p_left, __global ulong *p_right)
+ 	//vli_mult(l_productC, p_left, p_right);
+    // Create memory buffers on the device for each vector 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            2*LIST_SIZE * sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            LIST_SIZE * sizeof(ulong), A, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), B, 0, NULL, NULL);
+ 
+    // Create a program from the kernel source
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+ 
+    // Create the OpenCL kernel
+    cl_kernel kernel = clCreateKernel(program, "vli_mult", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&b_mem_obj);
+    
+ 
+    // Execute the OpenCL kernel on the list
+    size_t global_item_size = LIST_SIZE; // Process the entire lists
+    size_t local_item_size = 1; // Divide work items into groups of 64
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    // Read the memory buffer C on the device to the local variable C
+    ulong *C = (ulong*)malloc(sizeof(ulong)*LIST_SIZE*2);
+    ret = clEnqueueReadBuffer(command_queue, c_mem_obj, CL_TRUE, 0, 
+            2 * LIST_SIZE * sizeof(ulong), C, 0, NULL, NULL);
+ 
+	for(int i=0;i<2*LIST_SIZE;i++)
+    		l_product[i] = C[i];
+	
+    // Clean up
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseMemObject(c_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    
+    /////////////
+    //C Shit
+    /////////////
+    vli_mult(l_productC, p_left, p_right);
+    
+    /////////////
+    //COmpare
+    /////////////
+    int i;
+	for(i=0;i<8;i++) {
+		if(l_product[i]!=l_productC[i])
+  		{
+      		i=-1;
+	    	printf("\n~~~BBAADD~~~MULTI");
+	    	    printf("\nLEFT - ");
+	  		for(int j=0;j<4;j++)
+		  		printf(" %d",p_left[j]);
+   		 printf("\nRIGHT- ");
+	  for(int j=0;j<4;j++)
+		  printf(" %d",p_right[j]);
+    printf("\nG - ");
+	  for(int j=0;j<8;j++)
+		  printf(" %d",l_product[j]);
+    printf("\nC - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",l_productC[j]);
+	 printf("\n");
+      		break;
+   		}
+	}
+
+   /////////////
+    //OpenCL Shit
+    /////////////
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 	//(__global ulong *p_result, __global ulong *p_left, __global ulong *p_right)
+ 	//vli_mult(l_productC, p_left, p_right);
+    // Create memory buffers on the device for each vector 
+    a_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            2*LIST_SIZE * sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            LIST_SIZE * sizeof(ulong), p_result, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            2*LIST_SIZE * sizeof(ulong), l_product, 0, NULL, NULL);
+ 
+    // Create a program from the kernel source
+    program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    size_t len;
+	char buffer[2048];
+	for(int ntm = 0; ntm<2048;ntm++) buffer[ntm] = 0;
+	clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
+	for(int ntm = 0; ntm<2048;ntm++) printf("%c", buffer[ntm]);
+ 	
+    // Create the OpenCL kernel
+    kernel = clCreateKernel(program, "mmod_fast", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    ret = clEnqueueReadBuffer(command_queue, a_mem_obj, CL_TRUE, 0, 
+              LIST_SIZE * sizeof(ulong), p_result, 0, NULL, NULL);
+	
+    // Clean up
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    
+    /////////////
+    //C Shit
+    /////////////
+    uint64_t res2[NUM_ECC_DIGITS];
+    vli_mmod_fast(res2, l_product);
+    
+    
+    /////////////
+    //COmpare
+    /////////////
+
+	/*for(i=0;i<4;i++) {
+		if(res2[i]!=p_result[i])
+  		{
+      		i=-1;
+	    	printf("\n~~~BBAADD~~~");
+	    	    printf("\n---MMOD FAST---");
+	  printf("\nprod - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",l_product[j]);
+    printf("\nG - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",p_result[j]);
+    printf("\nC - ");
+    for(int j=0;j<8;j++)
+		  printf(" %d",res2[j]);
+	 printf("\n");
+      		break;
+   		}
+	}*/
+
+}
+
+/* Computes p_result = p_left^2 % curve_p. */
+static void vli_modSquare_fast(uint64_t *p_result, uint64_t *p_left)
+{
+    uint64_t l_product[2 * NUM_ECC_DIGITS];
+    vli_square(l_product, p_left);
+    vli_mmod_fast(p_result, l_product);
+}
+
+#define EVEN(vli) (!(vli[0] & 1))
+/* Computes p_result = (1 / p_input) % p_mod. All VLIs are the same size.
+   See "From Euclid's GCD to Montgomery Multiplication to the Great Divide"
+   https://labs.oracle.com/techrep/2001/smli_tr-2001-95.pdf */
+static void vli_modInv(uint64_t *p_result, uint64_t *p_input, uint64_t *p_mod)
+{
+    uint64_t a[NUM_ECC_DIGITS], b[NUM_ECC_DIGITS], u[NUM_ECC_DIGITS], v[NUM_ECC_DIGITS];
+    uint64_t l_carry;
+    int l_cmpResult;
+    
+    if(vli_isZero(p_input))
+    {
+        vli_clear(p_result);
+        return;
+    }
+
+    vli_set(a, p_input);
+    vli_set(b, p_mod);
+    vli_clear(u);
+    u[0] = 1;
+    vli_clear(v);
+    
+    while((l_cmpResult = vli_cmp(a, b)) != 0)
+    {
+        l_carry = 0;
+        if(EVEN(a))
+        {
+            vli_rshift1(a);
+            if(!EVEN(u))
+            {
+                l_carry = vli_add(u, u, p_mod);
+            }
+            vli_rshift1(u);
+            if(l_carry)
+            {
+                u[NUM_ECC_DIGITS-1] |= 0x8000000000000000ull;
+            }
+        }
+        else if(EVEN(b))
+        {
+            vli_rshift1(b);
+            if(!EVEN(v))
+            {
+                l_carry = vli_add(v, v, p_mod);
+            }
+            vli_rshift1(v);
+            if(l_carry)
+            {
+                v[NUM_ECC_DIGITS-1] |= 0x8000000000000000ull;
+            }
+        }
+        else if(l_cmpResult > 0)
+        {
+            vli_sub(a, a, b);
+            vli_rshift1(a);
+            if(vli_cmp(u, v) < 0)
+            {
+                vli_add(u, u, p_mod);
+            }
+            vli_sub(u, u, v);
+            if(!EVEN(u))
+            {
+                l_carry = vli_add(u, u, p_mod);
+            }
+            vli_rshift1(u);
+            if(l_carry)
+            {
+                u[NUM_ECC_DIGITS-1] |= 0x8000000000000000ull;
+            }
+        }
+        else
+        {
+            vli_sub(b, b, a);
+            vli_rshift1(b);
+            if(vli_cmp(v, u) < 0)
+            {
+                vli_add(v, v, p_mod);
+            }
+            vli_sub(v, v, u);
+            if(!EVEN(v))
+            {
+                l_carry = vli_add(v, v, p_mod);
+            }
+            vli_rshift1(v);
+            if(l_carry)
+            {
+                v[NUM_ECC_DIGITS-1] |= 0x8000000000000000ull;
+            }
+        }
+    }
+    
+    vli_set(p_result, u);
+}
+
+/* ------ Point operations ------ */
+
+/* Returns 1 if p_point is the point at infinity, 0 otherwise. */
+static int EccPoint_isZero(EccPoint *p_point)
+{
+    return (vli_isZero(p_point->x) && vli_isZero(p_point->y));
+}
+
+/* Point multiplication algorithm using Montgomery's ladder with co-Z coordinates.
+From http://eprint.iacr.org/2011/338.pdf
+*/
+
+/* Double in place */
+static void EccPoint_double_jacobian(uint64_t *X1, uint64_t *Y1, uint64_t *Z1)
+{
+    /* t1 = X, t2 = Y, t3 = Z */
+    uint64_t t4[NUM_ECC_DIGITS];
+    uint64_t t5[NUM_ECC_DIGITS];
+    
+    if(vli_isZero(Z1))
+    {
+        return;
+    }
+    vli_modSquare_fast(t4, Y1);   /* t4 = y1^2 */
+    
+    vli_modMult_fast(t5, X1, t4); /* t5 = x1*y1^2 = A */
+    
+    vli_modSquare_fast(t4, t4);   /* t4 = y1^4 */
+    vli_modMult_fast(Y1, Y1, Z1); /* t2 = y1*z1 = z3 */
+    vli_modSquare_fast(Z1, Z1);   /* t3 = z1^2 */
+    vli_modAdd(X1, X1, Z1, curve_p); /* t1 = x1 + z1^2 */
+    vli_modAdd(Z1, Z1, Z1, curve_p); /* t3 = 2*z1^2 */
+    vli_modSub(Z1, X1, Z1, curve_p); /* t3 = x1 - z1^2 */
+    vli_modMult_fast(X1, X1, Z1);    /* t1 = x1^2 - z1^4 */
+    
+    vli_modAdd(Z1, X1, X1, curve_p); /* t3 = 2*(x1^2 - z1^4) */
+    vli_modAdd(X1, X1, Z1, curve_p); /* t1 = 3*(x1^2 - z1^4) */
+    if(vli_testBit(X1, 0))
+    {
+        uint64_t l_carry = vli_add(X1, X1, curve_p);
+        vli_rshift1(X1);
+        X1[NUM_ECC_DIGITS-1] |= l_carry << 63;
+    }
+    else
+    {
+        vli_rshift1(X1);
+    }
+    /* t1 = 3/2*(x1^2 - z1^4) = B */
+    
+    vli_modSquare_fast(Z1, X1);      /* t3 = B^2 */
+    vli_modSub(Z1, Z1, t5, curve_p); /* t3 = B^2 - A */
+    vli_modSub(Z1, Z1, t5, curve_p); /* t3 = B^2 - 2A = x3 */
+    vli_modSub(t5, t5, Z1, curve_p); /* t5 = A - x3 */
+    vli_modMult_fast(X1, X1, t5);    /* t1 = B * (A - x3) */
+    vli_modSub(t4, X1, t4, curve_p); /* t4 = B * (A - x3) - y1^4 = y3 */
+    
+    vli_set(X1, Z1);
+    vli_set(Z1, Y1);
+    vli_set(Y1, t4);
+}
+
+/* Modify (x1, y1) => (x1 * z^2, y1 * z^3) */
+static void apply_z(uint64_t *X1, uint64_t *Y1, uint64_t *Z)
+{
+    uint64_t t1[NUM_ECC_DIGITS];
+
+    vli_modSquare_fast(t1, Z);    /* z^2 */
+    vli_modMult_fast(X1, X1, t1); /* x1 * z^2 */
+    vli_modMult_fast(t1, t1, Z);  /* z^3 */
+    vli_modMult_fast(Y1, Y1, t1); /* y1 * z^3 */
+}
+
+/* P = (x1, y1) => 2P, (x2, y2) => P' */
+static void XYcZ_initial_double(uint64_t *X1, uint64_t *Y1, uint64_t *X2, uint64_t *Y2, uint64_t *p_initialZ)
+{
+    uint64_t z[NUM_ECC_DIGITS];
+    
+    vli_set(X2, X1);
+   
+    vli_set(Y2, Y1);
+    
+    vli_clear(z);
+    z[0] = 1;
+    if(p_initialZ)
+    {
+        vli_set(z, p_initialZ);
+    }
+
+    apply_z(X1, Y1, z);
+    EccPoint_double_jacobian(X1, Y1, z);
+    apply_z(X2, Y2, z);
+}
+
+/* Input P = (x1, y1, Z), Q = (x2, y2, Z)
+   Output P' = (x1', y1', Z3), P + Q = (x3, y3, Z3)
+   or P => P', Q => P + Q
+*/
+static void XYcZ_add(uint64_t *X1, uint64_t *Y1, uint64_t *X2, uint64_t *Y2)
+{
+    /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+    uint64_t t5[NUM_ECC_DIGITS];
+    
+    vli_modSub(t5, X2, X1, curve_p); /* t5 = x2 - x1 */
+    vli_modSquare_fast(t5, t5);      /* t5 = (x2 - x1)^2 = A */
+    vli_modMult_fast(X1, X1, t5);    /* t1 = x1*A = B */
+    vli_modMult_fast(X2, X2, t5);    /* t3 = x2*A = C */
+    vli_modSub(Y2, Y2, Y1, curve_p); /* t4 = y2 - y1 */
+    vli_modSquare_fast(t5, Y2);      /* t5 = (y2 - y1)^2 = D */
+    
+    vli_modSub(t5, t5, X1, curve_p); /* t5 = D - B */
+    vli_modSub(t5, t5, X2, curve_p); /* t5 = D - B - C = x3 */
+    vli_modSub(X2, X2, X1, curve_p); /* t3 = C - B */
+    vli_modMult_fast(Y1, Y1, X2);    /* t2 = y1*(C - B) */
+    vli_modSub(X2, X1, t5, curve_p); /* t3 = B - x3 */
+    vli_modMult_fast(Y2, Y2, X2);    /* t4 = (y2 - y1)*(B - x3) */
+    vli_modSub(Y2, Y2, Y1, curve_p); /* t4 = y3 */
+    
+    vli_set(X2, t5);
+}
+
+/* Input P = (x1, y1, Z), Q = (x2, y2, Z)
+   Output P + Q = (x3, y3, Z3), P - Q = (x3', y3', Z3)
+   or P => P - Q, Q => P + Q
+*/
+static void XYcZ_addC(uint64_t *X1, uint64_t *Y1, uint64_t *X2, uint64_t *Y2)
+{
+    /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+    uint64_t t5[NUM_ECC_DIGITS];
+    uint64_t t6[NUM_ECC_DIGITS];
+    uint64_t t7[NUM_ECC_DIGITS];
+    
+    vli_modSub(t5, X2, X1, curve_p); /* t5 = x2 - x1 */
+    vli_modSquare_fast(t5, t5);      /* t5 = (x2 - x1)^2 = A */
+    vli_modMult_fast(X1, X1, t5);    /* t1 = x1*A = B */
+    vli_modMult_fast(X2, X2, t5);    /* t3 = x2*A = C */
+    vli_modAdd(t5, Y2, Y1, curve_p); /* t4 = y2 + y1 */
+    vli_modSub(Y2, Y2, Y1, curve_p); /* t4 = y2 - y1 */
+
+    vli_modSub(t6, X2, X1, curve_p); /* t6 = C - B */
+    vli_modMult_fast(Y1, Y1, t6);    /* t2 = y1 * (C - B) */
+    vli_modAdd(t6, X1, X2, curve_p); /* t6 = B + C */
+    vli_modSquare_fast(X2, Y2);      /* t3 = (y2 - y1)^2 */
+    vli_modSub(X2, X2, t6, curve_p); /* t3 = x3 */
+    
+    vli_modSub(t7, X1, X2, curve_p); /* t7 = B - x3 */
+    vli_modMult_fast(Y2, Y2, t7);    /* t4 = (y2 - y1)*(B - x3) */
+    vli_modSub(Y2, Y2, Y1, curve_p); /* t4 = y3 */
+    
+    vli_modSquare_fast(t7, t5);      /* t7 = (y2 + y1)^2 = F */
+    vli_modSub(t7, t7, t6, curve_p); /* t7 = x3' */
+    vli_modSub(t6, t7, X1, curve_p); /* t6 = x3' - B */
+    vli_modMult_fast(t6, t6, t5);    /* t6 = (y2 + y1)*(x3' - B) */
+    vli_modSub(Y1, t6, Y1, curve_p); /* t2 = y3' */
+    
+    vli_set(X1, t7);
+}
+
+static void EccPoint_mult(EccPoint *p_result, EccPoint *p_point, uint64_t *p_scalar, uint64_t *p_initialZ)
+{
+    /* R0 and R1 */
+    uint64_t Rx[2][NUM_ECC_DIGITS];
+    uint64_t Ry[2][NUM_ECC_DIGITS];
+    uint64_t z[NUM_ECC_DIGITS];
+    int i, nb;
+    
+    vli_set(Rx[1], p_point->x);
+    vli_set(Ry[1], p_point->y);
+    
+    XYcZ_initial_double(Rx[1], Ry[1], Rx[0], Ry[0], p_initialZ);
+    for(i = vli_numBits(p_scalar) - 2; i > 0; --i)
+    {
+        nb = !vli_testBit(p_scalar, i);
+        XYcZ_addC(Rx[1-nb], Ry[1-nb], Rx[nb], Ry[nb]);
+        XYcZ_add(Rx[nb], Ry[nb], Rx[1-nb], Ry[1-nb]);
+    }
+    nb = !vli_testBit(p_scalar, 0);
+    XYcZ_addC(Rx[1-nb], Ry[1-nb], Rx[nb], Ry[nb]);
+    /* Find final 1/Z value. */
+    vli_modSub(z, Rx[1], Rx[0], curve_p); /* X1 - X0 */
+    vli_modMult_fast(z, z, Ry[1-nb]);     /* Yb * (X1 - X0) */
+    vli_modMult_fast(z, z, p_point->x);   /* xP * Yb * (X1 - X0) */
+    vli_modInv(z, z, curve_p);            /* 1 / (xP * Yb * (X1 - X0)) */
+    vli_modMult_fast(z, z, p_point->y);   /* yP / (xP * Yb * (X1 - X0)) */
+    vli_modMult_fast(z, z, Rx[1-nb]);     /* Xb * yP / (xP * Yb * (X1 - X0)) */
+    /* End 1/Z calculation */
+
+    XYcZ_add(Rx[nb], Ry[nb], Rx[1-nb], Ry[1-nb]);
+    
+    apply_z(Rx[0], Ry[0], z);
+    
+    vli_set(p_result->x, Rx[0]);
+    vli_set(p_result->y, Ry[0]);
+}
+
+static void ecc_bytes2native(uint64_t p_native[NUM_ECC_DIGITS], const uint8_t p_bytes[ECC_BYTES])
+{
+    unsigned i;
+    for(i=0; i<NUM_ECC_DIGITS; ++i)
+    {
+        const uint8_t *p_digit = p_bytes + 8 * (NUM_ECC_DIGITS - 1 - i);
+        p_native[i] = ((uint64_t)p_digit[0] << 56) | ((uint64_t)p_digit[1] << 48) | ((uint64_t)p_digit[2] << 40) | ((uint64_t)p_digit[3] << 32) |
+            ((uint64_t)p_digit[4] << 24) | ((uint64_t)p_digit[5] << 16) | ((uint64_t)p_digit[6] << 8) | (uint64_t)p_digit[7];
+    }
+}
+
+static void ecc_native2bytes(uint8_t p_bytes[ECC_BYTES], const uint64_t p_native[NUM_ECC_DIGITS])
+{
+    unsigned i;
+    for(i=0; i<NUM_ECC_DIGITS; ++i)
+    {
+        uint8_t *p_digit = p_bytes + 8 * (NUM_ECC_DIGITS - 1 - i);
+        p_digit[0] = p_native[i] >> 56;
+        p_digit[1] = p_native[i] >> 48;
+        p_digit[2] = p_native[i] >> 40;
+        p_digit[3] = p_native[i] >> 32;
+        p_digit[4] = p_native[i] >> 24;
+        p_digit[5] = p_native[i] >> 16;
+        p_digit[6] = p_native[i] >> 8;
+        p_digit[7] = p_native[i];
+    }
+}
+
+/* Compute a = sqrt(a) (mod curve_p). */
+static void mod_sqrt(uint64_t a[NUM_ECC_DIGITS])
+{
+    unsigned i;
+    uint64_t p1[NUM_ECC_DIGITS] = {1};
+    uint64_t l_result[NUM_ECC_DIGITS] = {1};
+    
+    /* Since curve_p == 3 (mod 4) for all supported curves, we can
+       compute sqrt(a) = a^((curve_p + 1) / 4) (mod curve_p). */
+    vli_add(p1, curve_p, p1); /* p1 = curve_p + 1 */
+    for(i = vli_numBits(p1) - 1; i > 1; --i)
+    {
+        vli_modSquare_fast(l_result, l_result);
+        if(vli_testBit(p1, i))
+        {
+            vli_modMult_fast(l_result, l_result, a);
+        }
+    }
+    vli_set(a, l_result);
+}
+
+static void ecc_point_decompress(EccPoint *p_point, const uint8_t p_compressed[ECC_BYTES+1])
+{
+    uint64_t _3[NUM_ECC_DIGITS] = {3}; /* -a = 3 */
+    ecc_bytes2native(p_point->x, p_compressed+1);
+    
+    vli_modSquare_fast(p_point->y, p_point->x); /* y = x^2 */
+    vli_modSub(p_point->y, p_point->y, _3, curve_p); /* y = x^2 - 3 */
+    vli_modMult_fast(p_point->y, p_point->y, p_point->x); /* y = x^3 - 3x */
+    vli_modAdd(p_point->y, p_point->y, curve_b, curve_p); /* y = x^3 - 3x + b */
+    
+    mod_sqrt(p_point->y);
+    
+    if((p_point->y[0] & 0x01) != (p_compressed[0] & 0x01))
+    {
+        vli_sub(p_point->y, curve_p, p_point->y);
+    }
+}
+
+int ecc_make_key(uint8_t p_publicKey[ECC_BYTES+1], uint8_t p_privateKey[ECC_BYTES])
+{
+    uint64_t l_private[NUM_ECC_DIGITS];
+    EccPoint l_public;
+    unsigned l_tries = 0;
+    
+    do
+    {
+        
+        if(!getRandomNumber(l_private) || (l_tries++ >= MAX_TRIES))
+        {
+            return 0;
+        }
+        if(vli_isZero(l_private))
+        {
+            continue;
+        }
+      
+        /* Make sure the private key is in the range [1, n-1].
+           For the supported curves, n is always large enough that we only need to subtract once at most. */
+        if(vli_cmp(curve_n, l_private) != 1)
+        {
+            vli_sub(l_private, l_private, curve_n);
+        }
+        EccPoint_mult(&l_public, &curve_G, l_private, NULL);
+    } while(EccPoint_isZero(&l_public));
+    
+    ecc_native2bytes(p_privateKey, l_private);
+    ecc_native2bytes(p_publicKey + 1, l_public.x);
+    p_publicKey[0] = 2 + (l_public.y[0] & 0x01);
+    return 1;
+}
+
+int ecdh_shared_secret(const uint8_t p_publicKey[ECC_BYTES+1], const uint8_t p_privateKey[ECC_BYTES], uint8_t p_secret[ECC_BYTES])
+{
+    EccPoint l_public;
+    uint64_t l_private[NUM_ECC_DIGITS];
+    uint64_t l_random[NUM_ECC_DIGITS];
+    
+    if(!getRandomNumber(l_random))
+    {
+        return 0;
+    }
+    
+    ecc_point_decompress(&l_public, p_publicKey);
+    ecc_bytes2native(l_private, p_privateKey);
+    
+    EccPoint l_product;
+    EccPoint_mult(&l_product, &l_public, l_private, l_random);
+    
+    ecc_native2bytes(p_secret, l_product.x);
+    
+    return !EccPoint_isZero(&l_product);
+}
+
+/* -------- ECDSA code -------- */
+
+static void vli_modMultC(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+    uint64_t l_product[2 * NUM_ECC_DIGITS];
+    uint64_t l_modMultiple[2 * NUM_ECC_DIGITS];
+    uint l_digitShift, l_bitShift;
+    uint l_productBits;
+    uint l_modBits = vli_numBits(p_mod);
+    
+    vli_mult(l_product, p_left, p_right);
+    l_productBits = vli_numBits(l_product + NUM_ECC_DIGITS);
+    if(l_productBits)
+    {
+        l_productBits += NUM_ECC_DIGITS * 64;
+    }
+    else
+    {
+        l_productBits = vli_numBits(l_product);
+    }
+    
+    if(l_productBits < l_modBits)
+    { /* l_product < p_mod. */
+        vli_set(p_result, l_product);
+        return;
+    }
+    
+    /* Shift p_mod by (l_leftBits - l_modBits). This multiplies p_mod by the largest
+       power of two possible while still resulting in a number less than p_left. */
+    vli_clear(l_modMultiple);
+    vli_clear(l_modMultiple + NUM_ECC_DIGITS);
+    l_digitShift = (l_productBits - l_modBits) / 64;
+    l_bitShift = (l_productBits - l_modBits) % 64;
+    if(l_bitShift)
+    {
+        l_modMultiple[l_digitShift + NUM_ECC_DIGITS] = vli_lshift(l_modMultiple + l_digitShift, p_mod, l_bitShift);
+    }
+    else
+    {
+        vli_set(l_modMultiple + l_digitShift, p_mod);
+    }
+
+    /* Subtract all multiples of p_mod to get the remainder. */
+    vli_clear(p_result);
+    p_result[0] = 1; /* Use p_result as a temp var to store 1 (for subtraction) */
+    while(l_productBits > NUM_ECC_DIGITS * 64 || vli_cmp(l_modMultiple, p_mod) >= 0)
+    {
+        int l_cmp = vli_cmp(l_modMultiple + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS);
+        if(l_cmp < 0 || (l_cmp == 0 && vli_cmp(l_modMultiple, l_product) <= 0))
+        {
+            if(vli_sub(l_product, l_product, l_modMultiple))
+            { /* borrow */
+                vli_sub(l_product + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS, p_result);
+            }
+            vli_sub(l_product + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS, l_modMultiple + NUM_ECC_DIGITS);
+        }
+        uint64_t l_carry = (l_modMultiple[NUM_ECC_DIGITS] & 0x01) << 63;
+        vli_rshift1(l_modMultiple + NUM_ECC_DIGITS);
+        vli_rshift1(l_modMultiple);
+        l_modMultiple[NUM_ECC_DIGITS-1] |= l_carry;
+        
+        --l_productBits;
+    }
+    vli_set(p_result, l_product);
+}
+
+static void vli_modMultG(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+	uint64_t l_product[2 * NUM_ECC_DIGITS];
+    uint64_t l_productC[2 * NUM_ECC_DIGITS];
+    uint64_t l_modMultiple[2 * NUM_ECC_DIGITS];
+    uint l_digitShift, l_bitShift;
+    uint l_productBits;
+    uint l_modBits = vli_numBits(p_mod);
+    /////////////
+    //OpenCL Shit
+    /////////////
+    const int LIST_SIZE = 4;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+ 	uint64_t *A = p_left;
+	uint64_t *B = p_right;
+	uint64_t l_carry;
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ //(__global ulong *p_result, __global ulong *p_left, __global ulong *p_right)
+ //vli_mult(l_productC, p_left, p_right);
+    // Create memory buffers on the device for each vector 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            LIST_SIZE * sizeof(ulong), A, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), B, 0, NULL, NULL);
+ 	
+    // Create a program from the kernel source
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+ 	// Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    size_t len;
+	char buffer[2048];
+	for(int ntm = 0; ntm<2048;ntm++) buffer[ntm] = 0;
+	clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
+	for(int ntm = 0; ntm<2048;ntm++) printf("%c", buffer[ntm]);
+    // Create the OpenCL kernel
+    cl_kernel kernel = clCreateKernel(program, "vli_mult", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&b_mem_obj);
+    
+ 
+    // Execute the OpenCL kernel on the list
+    size_t global_item_size = LIST_SIZE; // Process the entire lists
+    size_t local_item_size = 1; // Divide work items into groups of 64
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    // Read the memory buffer C on the device to the local variable C
+    ulong *C = (ulong*)malloc(sizeof(ulong)*LIST_SIZE);
+    ret = clEnqueueReadBuffer(command_queue, c_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), C, 0, NULL, NULL);
+ 
+	for(int i=0;i<LIST_SIZE;i++)
+    		p_result[i] = C[i];
+	
+    // Clean p
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseMemObject(c_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    
+    /////////////
+    //C Shit
+    /////////////
+    vli_mult(l_productC, p_left, p_right);
+    
+    /////////////
+    //COmpare
+    /////////////
+    int flag = 0;
+    for(int k = 0; k < NUM_ECC_DIGITS; k++){
+		if(l_product[k] != l_productC[k]){
+			printf("\nBAAAAAAAAAAAAAAAAD MULTIPLICATION");
+			flag = 1;
+			break;
+		}
+	}
+	if(flag == 0) printf("\nGOOOOOOOOOOOOOD MULTIPLICATION");
+	else{
+		printf("\nOpenCL :\n");
+		for(int k = 0; k < 2*NUM_ECC_DIGITS; k++) printf("%d", l_product[k]);
+    		printf("\nC :\n");
+    		for(int k = 0; k < 2*NUM_ECC_DIGITS; k++) printf("%d", l_productC[k]);
+    		printf("\n");
+		vli_mult(l_product, p_left, p_right); 
+    } 
+    
+    
+    l_productBits = vli_numBits(l_product + NUM_ECC_DIGITS);
+    if(l_productBits)
+    {
+        l_productBits += NUM_ECC_DIGITS * 64;
+    }
+    else
+    {
+        l_productBits = vli_numBits(l_product);
+    }
+    
+    if(l_productBits < l_modBits)
+    { /* l_product < p_mod. */
+        vli_set(p_result, l_product);
+        return;
+    }
+    
+    /* Shift p_mod by (l_leftBits - l_modBits). This multiplies p_mod by the largest
+       power of two possible while still resulting in a number less than p_left. */
+    vli_clear(l_modMultiple);
+    vli_clear(l_modMultiple + NUM_ECC_DIGITS);
+    l_digitShift = (l_productBits - l_modBits) / 64;
+    l_bitShift = (l_productBits - l_modBits) % 64;
+    if(l_bitShift)
+    {
+        l_modMultiple[l_digitShift + NUM_ECC_DIGITS] = vli_lshift(l_modMultiple + l_digitShift, p_mod, l_bitShift);
+    }
+    else
+    {
+        vli_set(l_modMultiple + l_digitShift, p_mod);
+    }
+
+    /* Subtract all multiples of p_mod to get the remainder. */
+    vli_clear(p_result);
+    p_result[0] = 1; /* Use p_result as a temp var to store 1 (for subtraction) */
+    while(l_productBits > NUM_ECC_DIGITS * 64 || vli_cmp(l_modMultiple, p_mod) >= 0)
+    {
+        int l_cmp = vli_cmp(l_modMultiple + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS);
+        if(l_cmp < 0 || (l_cmp == 0 && vli_cmp(l_modMultiple, l_product) <= 0))
+        {
+            if(vli_sub(l_product, l_product, l_modMultiple))
+            { /* borrow */
+                vli_sub(l_product + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS, p_result);
+            }
+            vli_sub(l_product + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS, l_modMultiple + NUM_ECC_DIGITS);
+        }
+        uint64_t l_carry = (l_modMultiple[NUM_ECC_DIGITS] & 0x01) << 63;
+        vli_rshift1(l_modMultiple + NUM_ECC_DIGITS);
+        vli_rshift1(l_modMultiple);
+        l_modMultiple[NUM_ECC_DIGITS-1] |= l_carry;
+        
+        --l_productBits;
+    }
+    vli_set(p_result, l_product);
+  /*  uint64_t l_product[2 * NUM_ECC_DIGITS];
+    uint64_t l_productC[2 * NUM_ECC_DIGITS];
+    uint64_t l_modMultiple[2 * NUM_ECC_DIGITS];
+    uint l_digitShift, l_bitShift;
+    uint l_productBits;
+    uint l_modBits = vli_numBits(p_mod);
+    /////////////
+    //OpenCL Shit
+    /////////////
+    const int LIST_SIZE = 4;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+ 	uint64_t *A = p_left;
+	uint64_t *B = p_right;
+	uint64_t l_carry;
+    fp = fopen("vector_add_kernel.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    // Get platform and device information
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    // Create an OpenCL context
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    // Create a command queue
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ //(__global ulong *p_result, __global ulong *p_left, __global ulong *p_right)
+ //vli_mult(l_productC, p_left, p_right);
+    // Create memory buffers on the device for each vector 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+    cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+            LIST_SIZE * sizeof(ulong), NULL, &ret);
+ 
+    // Copy the lists A and B to their respective memory buffers
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+            LIST_SIZE * sizeof(ulong), A, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), B, 0, NULL, NULL);
+ 	
+    // Create a program from the kernel source
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    // Build the program
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+ 
+    // Create the OpenCL kernel
+    cl_kernel kernel = clCreateKernel(program, "vli_mult", &ret);
+ 
+    // Set the arguments of the kernel
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&b_mem_obj);
+    
+ 
+    // Execute the OpenCL kernel on the list
+    size_t global_item_size = LIST_SIZE; // Process the entire lists
+    size_t local_item_size = 1; // Divide work items into groups of 64
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    // Read the memory buffer C on the device to the local variable C
+    ulong *C = (ulong*)malloc(sizeof(ulong)*LIST_SIZE);
+    ret = clEnqueueReadBuffer(command_queue, c_mem_obj, CL_TRUE, 0, 
+            LIST_SIZE * sizeof(ulong), C, 0, NULL, NULL);
+ 
+	for(int i=0;i<LIST_SIZE;i++)
+    		p_result[i] = C[i];
+	
+    // Clean up
+    ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseMemObject(c_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+    
+    /////////////
+    //C Shit
+    /////////////
+    vli_mult(l_productC, p_left, p_right);
+    
+    /////////////
+    //COmpare
+    /////////////
+    int flag = 0;
+    for(int k = 0; k < NUM_ECC_DIGITS; k++){
+		if(l_product[k] != l_productC[k]){
+			printf("BAAAAAAAAAAAAAAAAD MULTIPLICATION");
+			flag = 1;
+			break;
+		}
+	}
+	if(flag == 0) printf("GOOOOOOOOOOOOOD MULTIPLICATION");
+	else{
+		printf("OpenCL :\n");
+		for(int k = 0; k < NUM_ECC_DIGITS; k++) printf("%d", l_product[k]);
+    	printf("C :\n");
+    	for(int k = 0; k < NUM_ECC_DIGITS; k++) printf("%d", l_productC[k]);
+    	printf("\n");
+    }
+    
+    l_productBits = vli_numBits(l_product + NUM_ECC_DIGITS);
+    if(l_productBits)
+    {
+        l_productBits += NUM_ECC_DIGITS * 64;
+    }
+    else
+    {
+        l_productBits = vli_numBits(l_product);
+    }
+    
+    if(l_productBits < l_modBits)
+    { /* l_product < p_mod. 
+        vli_set(p_result, l_product);
+        return;
+    }
+    
+    /* Shift p_mod by (l_leftBits - l_modBits). This multiplies p_mod by the largest
+       power of two possible while still resulting in a number less than p_left. */
+       /*/
+    vli_clear(l_modMultiple);
+    vli_clear(l_modMultiple + NUM_ECC_DIGITS);
+    l_digitShift = (l_productBits - l_modBits) / 64;
+    l_bitShift = (l_productBits - l_modBits) % 64;
+    if(l_bitShift)
+    {
+        l_modMultiple[l_digitShift + NUM_ECC_DIGITS] = vli_lshift(l_modMultiple + l_digitShift, p_mod, l_bitShift);
+    }
+    else
+    {
+        vli_set(l_modMultiple + l_digitShift, p_mod);
+    }
+
+    /* Subtract all multiples of p_mod to get the remainder. *//*
+    vli_clear(p_result);
+    p_result[0] = 1; /* Use p_result as a temp var to store 1 (for subtraction) *//*/
+    while(l_productBits > NUM_ECC_DIGITS * 64 || vli_cmp(l_modMultiple, p_mod) >= 0)
+    {
+        int l_cmp = vli_cmp(l_modMultiple + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS);
+        if(l_cmp < 0 || (l_cmp == 0 && vli_cmp(l_modMultiple, l_product) <= 0))
+        {
+            if(vli_sub(l_product, l_product, l_modMultiple))
+            { /* borrow *//*
+                vli_sub(l_product + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS, p_result);
+            }
+            vli_sub(l_product + NUM_ECC_DIGITS, l_product + NUM_ECC_DIGITS, l_modMultiple + NUM_ECC_DIGITS);
+        }
+        uint64_t l_carry = (l_modMultiple[NUM_ECC_DIGITS] & 0x01) << 63;
+        vli_rshift:1(l_modMultiple + NUM_ECC_DIGITS);
+        vli_rshift1(l_modMultiple);
+        l_modMultiple[NUM_ECC_DIGITS-1] |= l_carry;
+        
+        --l_productBits;
+    }
+    vli_set(p_result, l_product);*/
+}
+
+
+/* Computes p_result = (p_left * p_right) % p_mod. */
+static void vli_modMult(uint64_t *p_result, uint64_t *p_left, uint64_t *p_right, uint64_t *p_mod)
+{
+
+//uint64_t cpu_res[4];
+//vli_modMultC(p_result,p_left, p_right,  p_mod  );
+vli_modMultC(p_result,p_left, p_right,  p_mod );
+
+
+}
+
+static uint umax(uint a, uint b)
+{
+    return (a > b ? a : b);
+}
+
+int ecdsa_sign(const uint8_t p_privateKey[ECC_BYTES], const uint8_t p_hash[ECC_BYTES], uint8_t p_signature[ECC_BYTES*2])
+{
+    uint64_t k[NUM_ECC_DIGITS];
+    uint64_t l_tmp[NUM_ECC_DIGITS];
+    uint64_t l_s[NUM_ECC_DIGITS];
+    EccPoint p;
+    unsigned l_tries = 0;
+    
+    do
+    {
+        if(!getRandomNumber(k) || (l_tries++ >= MAX_TRIES))
+        {
+            return 0;
+        }
+        if(vli_isZero(k))
+        {
+            continue;
+        }
+    
+        if(vli_cmp(curve_n, k) != 1)
+        {
+            vli_sub(k, k, curve_n);
+        }
+    
+        /* tmp = k * G */
+        EccPoint_mult(&p, &curve_G, k, NULL);
+    
+        /* r = x1 (mod n) */
+        if(vli_cmp(curve_n, p.x) != 1)
+        {
+            vli_sub(p.x, p.x, curve_n);
+        }
+    } while(vli_isZero(p.x));
+
+    ecc_native2bytes(p_signature, p.x);
+    
+    ecc_bytes2native(l_tmp, p_privateKey);
+    vli_modMult(l_s, p.x, l_tmp, curve_n); /* s = r*d */
+    ecc_bytes2native(l_tmp, p_hash);
+    vli_modAdd(l_s, l_tmp, l_s, curve_n); /* s = e + r*d */
+    vli_modInv(k, k, curve_n); /* k = 1 / k */
+    vli_modMult(l_s, l_s, k, curve_n); /* s = (e + r*d) / k */
+    ecc_native2bytes(p_signature + ECC_BYTES, l_s);
+    
+    return 1;
+}
+
+int ecdsa_verify(const uint8_t p_publicKey[ECC_BYTES+1], const uint8_t p_hash[ECC_BYTES], const uint8_t p_signature[ECC_BYTES*2])
+{
+    uint64_t u1[NUM_ECC_DIGITS], u2[NUM_ECC_DIGITS];
+    uint64_t z[NUM_ECC_DIGITS];
+    EccPoint l_public, l_sum;
+    uint64_t rx[NUM_ECC_DIGITS];
+    uint64_t ry[NUM_ECC_DIGITS];
+    uint64_t tx[NUM_ECC_DIGITS];
+    uint64_t ty[NUM_ECC_DIGITS];
+    uint64_t tz[NUM_ECC_DIGITS];
+    
+    uint64_t l_r[NUM_ECC_DIGITS], l_s[NUM_ECC_DIGITS];
+    
+    ecc_point_decompress(&l_public, p_publicKey);
+    ecc_bytes2native(l_r, p_signature);
+    ecc_bytes2native(l_s, p_signature + ECC_BYTES);
+
+    
+   // vli_isZeroCL    
+    if(vli_isZero(l_r) || vli_isZero(l_s))
+    { /* r, s must not be 0. */
+        return 0;
+    }
+    
+    if(vli_cmp(curve_n, l_r) != 1 || vli_cmp(curve_n, l_s) != 1)
+    { /* r, s must be < n. */
+        return 0;
+    }
+
+    /* Calculate u1 and u2. */
+    vli_modInv(z, l_s, curve_n); /* Z = s^-1 */
+    ecc_bytes2native(u1, p_hash);
+    vli_modMult(u1, u1, z, curve_n); /* u1 = e/s */
+    vli_modMult(u2, l_r, z, curve_n); /* u2 = r/s */
+    
+    /* Calculate l_sum = G + Q. */
+    vli_set(l_sum.x, l_public.x);
+    vli_set(l_sum.y, l_public.y);
+    vli_set(tx, curve_G.x);
+    vli_set(ty, curve_G.y);
+    vli_modSub(z, l_sum.x, tx, curve_p); /* Z = x2 - x1 */
+    XYcZ_add(tx, ty, l_sum.x, l_sum.y);
+    vli_modInv(z, z, curve_p); /* Z = 1/Z */
+    apply_z(l_sum.x, l_sum.y, z);
+    
+    /* Use Shamir's trick to calculate u1*G + u2*Q */
+    EccPoint *l_points[4] = {NULL, &curve_G, &l_public, &l_sum};
+    uint l_numBits = umax(vli_numBits(u1), vli_numBits(u2));
+    
+    EccPoint *l_point = l_points[(!!vli_testBit(u1, l_numBits-1)) | ((!!vli_testBit(u2, l_numBits-1)) << 1)];
+    vli_set(rx, l_point->x);
+    vli_set(ry, l_point->y);
+    vli_clear(z);
+    z[0] = 1;
+
+    int i;
+    for(i = l_numBits - 2; i >= 0; --i)
+    {
+        EccPoint_double_jacobian(rx, ry, z);
+        
+        int l_index = (!!vli_testBit(u1, i)) | ((!!vli_testBit(u2, i)) << 1);
+        EccPoint *l_point = l_points[l_index];
+        if(l_point)
+        {
+            vli_set(tx, l_point->x);
+            vli_set(ty, l_point->y);
+            apply_z(tx, ty, z);
+            vli_modSub(tz, rx, tx, curve_p); /* Z = x2 - x1 */
+            XYcZ_add(tx, ty, rx, ry);
+            vli_modMult_fast(z, z, tz);
+        }
+    }
+
+    vli_modInv(z, z, curve_p); /* Z = 1/Z */
+    apply_z(rx, ry, z);
+    
+    /* v = x1 (mod n) */
+    if(vli_cmp(curve_n, rx) != 1)
+    {
+        vli_sub(rx, rx, curve_n);
+    }
+
+    /* Accept only if v == r. */
+    return (vli_cmp(rx, l_r) == 0);
+}
+
+
+int main(void) {
+    // Create the two input vectors
+   int i;
+	uint8_t publicKey[ECC_BYTES+1];
+    uint8_t privateKey[ECC_BYTES];
+    uint8_t hash[ECC_BYTES];
+    uint8_t signature[ECC_BYTES*2];
+    int retECC = ecc_make_key(publicKey,privateKey);
+	uint64_t p_left[NUM_ECC_DIGITS];
+	uint64_t p_right[NUM_ECC_DIGITS];
+	uint64_t result[NUM_ECC_DIGITS];
+
+    printf("public key: ");
+    for(int i = 0; i<=ECC_BYTES; i++)
+    	printf("%d", publicKey[i]);
+    printf("\n");
+
+    printf("private key: ");
+    for(int i = 0; i<ECC_BYTES; i++)
+    	printf("%d", privateKey[i]);
+    printf("\n");
+
+    for(int i = 0; i<ECC_BYTES; i++)
+	hash[i] = 1;
+
+    printf("hash: ");
+    for(int i = 0; i<ECC_BYTES; i++)
+    	printf("%d", hash[i]);
+    printf("\n");
+    
+
+    ecdsa_sign(privateKey, hash, signature);
+
+    
+    printf("signature: ");
+    for(int i = 0; i<ECC_BYTES*2; i++)
+    	printf("%d", signature[i]);
+    printf("\n");
+    retECC = ecdsa_verify(publicKey, hash, signature);
+    printf("is it valid? %d \n", retECC);
+    
+
+    return 0;
+}
