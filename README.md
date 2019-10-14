@@ -8,4 +8,4 @@ bit_cl is an extracted code of the secp256k1 lib for the signature verification 
 
 deprecated is the first simple ECDSA C code with an implementation in OpenCL
 
-STATUS: debugging the implementation of OpenCL code and the integration with the origianl secp256k1.
+STATUS: we're implementing and debugging the OpenCL code and the integration with the original secp256k1 lib.
