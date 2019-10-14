@@ -2,3 +2,4 @@
 secp256k1-opencl/* linguist-vendored=false	
 deprecated/* linguist-vendored=false	
 *.md linguist-vendored=false	
+*.cl linguist-vendored=false	
