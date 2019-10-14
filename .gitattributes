@@ -1,5 +1,5 @@
 * linguist-vendored	
 secp256k1-opencl/* linguist-vendored=false	
 deprecated/* linguist-vendored=false	
-*.md linguist-vendored=false	
+*.md linguist-documentation=false
 *.cl linguist-vendored=false	
