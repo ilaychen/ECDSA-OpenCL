@@ -1,3 +1,0 @@
-* linguist-vendored
-*.js linguist-vendored=false
- *.* linguist-language=C
