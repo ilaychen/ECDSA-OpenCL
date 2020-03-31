@@ -3,6 +3,7 @@
  * Distributed under the MIT software license, see the accompanying   *
  * file COPYING or http://www.opensource.org/licenses/mit-license.php.*
  **********************************************************************/
+ /*Copyright Ilay Chen and Yakir Fenton*/
 
 #if defined HAVE_CONFIG_H
 #include "libsecp256k1-config.h"
@@ -16,7 +17,7 @@
 #endif
 
 #include <stdio.h>
-#include <stdlib.h>secp256k1_ecdsa_verifyX
+#include <stdlib.h>
 
 #include <time.h>
 
@@ -48,6 +49,8 @@
 
 typedef __int128 int128_t;
 typedef unsigned __int128 uint128_t;
+
+#include <unistd.h>
 
 # define SECP256K1_RESTRICT
 
@@ -84,9 +87,11 @@ typedef unsigned __int128 uint128_t;
 
 #define ECMULT_TABLE_GET_GE_STORAGE(r,pre,n,w) do { \
     if ((n) > 0) { \
-        secp256k1_ge_from_storageX((r), &(pre)[((n)-1)/2]); \
+		printf("+ A C y %ul \n", (pre)[((n)-1)/2].x.n[0]); \
+        secp256k1_ge_from_storageX_m((r), (pre)[((n)-1)/2]); \
     } else { \
-        secp256k1_ge_from_storageX((r), &(pre)[(-(n)-1)/2]); \
+		printf("- A C y %ul \n", (pre)[(-(n)-1)/2].x.n[0]); \
+        secp256k1_ge_from_storageX_m((r), (pre)[(-(n)-1)/2]); \
         secp256k1_fe_negateX(&((r)->y), &((r)->y), 1); \
     } \
 } while(0)
@@ -749,6 +754,25 @@ void secp256k1_fe_clearX(secp256k1_feX *a) {
     }
 }
 
+
+void secp256k1_fe_from_storageX_m(secp256k1_feX *r, secp256k1_fe_storageX a) {
+    r->n[0] = a.n[0] & 0xFFFFFFFFFFFFFULL;
+    r->n[1] = a.n[0] >> 52 | ((a.n[1] << 12) & 0xFFFFFFFFFFFFFULL);
+    r->n[2] = a.n[1] >> 40 | ((a.n[2] << 24) & 0xFFFFFFFFFFFFFULL);
+    r->n[3] = a.n[2] >> 28 | ((a.n[3] << 36) & 0xFFFFFFFFFFFFFULL);
+    r->n[4] = a.n[3] >> 16;
+    r->magnitude = 1;
+    r->normalized = 1;
+}
+
+static void secp256k1_ge_from_storageX_m(secp256k1_geX *r, secp256k1_ge_storageX a) {
+	printf("ge C %ul %ul \n", a.x.n[0], a.y.n[0]);
+    secp256k1_fe_from_storageX_m(&r->x, a.x);
+    secp256k1_fe_from_storageX_m(&r->y, a.y);
+	/*printf("C %ul %ul %ul %ul \n", r->x.n[0], r->y.n[0], a->x.n[0], a->y.n[0]);*/
+    r->infinity = 0;
+}
+
 void secp256k1_fe_from_storageX(secp256k1_feX *r, const secp256k1_fe_storageX *a) {
     r->n[0] = a->n[0] & 0xFFFFFFFFFFFFFULL;
     r->n[1] = a->n[0] >> 52 | ((a->n[1] << 12) & 0xFFFFFFFFFFFFFULL);
@@ -760,8 +784,10 @@ void secp256k1_fe_from_storageX(secp256k1_feX *r, const secp256k1_fe_storageX *a
 }
 
 static void secp256k1_ge_from_storageX(secp256k1_geX *r, const secp256k1_ge_storageX *a) {
+	/*printf("ge C %ul %ul \n", a->x.n[0], a->y.n[0]);*/
     secp256k1_fe_from_storageX(&r->x, &a->x);
     secp256k1_fe_from_storageX(&r->y, &a->y);
+	/*printf("C %ul %ul %ul %ul \n", r->x.n[0], r->y.n[0], a->x.n[0], a->y.n[0]);*/
     r->infinity = 0;
 }
 
@@ -816,6 +842,101 @@ void secp256k1_fe_mul_intX(secp256k1_feX *r, int a) {
     r->normalized = 0;
     secp256k1_fe_verifyX(r);
 }
+
+void secp256k1_fe_mul_innerX_z(uint64_t *r, const uint64_t *a, const uint64_t * SECP256K1_RESTRICT b) {
+    uint64_t c, d;
+    uint64_t t3, t4, tx, u0;
+    uint64_t a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4];
+    const uint64_t M = 0xFFFFFFFFFFFFFULL, R = 0x1000003D10ULL;
+
+
+    /*  [... a b c] is a shorthand for ... + a<<104 + b<<52 + c<<0 mod n.
+     *  for 0 <= x <= 4, px is a shorthand for sum(a[i]*b[x-i], i=0..x).
+     *  for 4 <= x <= 8, px is a shorthand for sum(a[i]*b[x-i], i=(x-4)..4)
+     *  Note that [x 0 0 0 0 0] = [x*R].
+     */
+
+    d  = (uint128_t)a0 * b[3]
+       + (uint128_t)a1 * b[2]
+       + (uint128_t)a2 * b[1]
+       + (uint128_t)a3 * b[0];
+    /* [d 0 0 0] = [p3 0 0 0] */
+    c  = (uint128_t)a4 * b[4];
+    /* [c 0 0 0 0 d 0 0 0] = [p8 0 0 0 0 p3 0 0 0] */
+    d += (c & M) * R; c >>= 52;
+    /* [c 0 0 0 0 0 d 0 0 0] = [p8 0 0 0 0 p3 0 0 0] */
+    t3 = d & M; d >>= 52;
+    /* [c 0 0 0 0 d t3 0 0 0] = [p8 0 0 0 0 p3 0 0 0] */
+
+    d += (uint128_t)a0 * b[4]
+       + (uint128_t)a1 * b[3]
+       + (uint128_t)a2 * b[2]
+       + (uint128_t)a3 * b[1]
+       + (uint128_t)a4 * b[0];
+    /* [c 0 0 0 0 d t3 0 0 0] = [p8 0 0 0 p4 p3 0 0 0] */
+    d += c * R;
+    /* [d t3 0 0 0] = [p8 0 0 0 p4 p3 0 0 0] */
+    t4 = d & M; d >>= 52;
+    /* [d t4 t3 0 0 0] = [p8 0 0 0 p4 p3 0 0 0] */
+    tx = (t4 >> 48); t4 &= (M >> 4);
+    /* [d t4+(tx<<48) t3 0 0 0] = [p8 0 0 0 p4 p3 0 0 0] */
+
+    c  = (uint128_t)a0 * b[0];
+    /* [d t4+(tx<<48) t3 0 0 c] = [p8 0 0 0 p4 p3 0 0 p0] */
+    d += (uint128_t)a1 * b[4]
+       + (uint128_t)a2 * b[3]
+       + (uint128_t)a3 * b[2]
+       + (uint128_t)a4 * b[1];
+    /* [d t4+(tx<<48) t3 0 0 c] = [p8 0 0 p5 p4 p3 0 0 p0] */
+    u0 = d & M; d >>= 52;
+    /* [d u0 t4+(tx<<48) t3 0 0 c] = [p8 0 0 p5 p4 p3 0 0 p0] */
+    /* [d 0 t4+(tx<<48)+(u0<<52) t3 0 0 c] = [p8 0 0 p5 p4 p3 0 0 p0] */
+    u0 = (u0 << 4) | tx;
+    /* [d 0 t4+(u0<<48) t3 0 0 c] = [p8 0 0 p5 p4 p3 0 0 p0] */
+    c += (uint128_t)u0 * (R >> 4);
+    /* [d 0 t4 t3 0 0 c] = [p8 0 0 p5 p4 p3 0 0 p0] */
+    r[0] = c & M; c >>= 52;
+	/*printf("\n??? C %lu", c);
+	printf("\n??? M %lu", M);
+	printf("\n??? cM %lu", c & M);*/
+    /* [d 0 t4 t3 0 c r0] = [p8 0 0 p5 p4 p3 0 0 p0] */
+
+    c += (uint128_t)a0 * b[1]
+       + (uint128_t)a1 * b[0];
+    /* [d 0 t4 t3 0 c r0] = [p8 0 0 p5 p4 p3 0 p1 p0] */
+    d += (uint128_t)a2 * b[4]
+       + (uint128_t)a3 * b[3]
+       + (uint128_t)a4 * b[2];
+    /* [d 0 t4 t3 0 c r0] = [p8 0 p6 p5 p4 p3 0 p1 p0] */
+    c += (d & M) * R; d >>= 52;
+    /* [d 0 0 t4 t3 0 c r0] = [p8 0 p6 p5 p4 p3 0 p1 p0] */
+    r[1] = c & M; c >>= 52;
+    /* [d 0 0 t4 t3 c r1 r0] = [p8 0 p6 p5 p4 p3 0 p1 p0] */
+
+    c += (uint128_t)a0 * b[2]
+       + (uint128_t)a1 * b[1]
+       + (uint128_t)a2 * b[0];
+    /* [d 0 0 t4 t3 c r1 r0] = [p8 0 p6 p5 p4 p3 p2 p1 p0] */
+    d += (uint128_t)a3 * b[4]
+       + (uint128_t)a4 * b[3];
+    /* [d 0 0 t4 t3 c t1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+    c += (d & M) * R; d >>= 52;
+    /* [d 0 0 0 t4 t3 c r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+
+    /* [d 0 0 0 t4 t3 c r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+    r[2] = c & M; c >>= 52;
+    /* [d 0 0 0 t4 t3+c r2 r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+    c   += d * R + t3;
+    /* [t4 c r2 r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+    r[3] = c & M; c >>= 52;
+    /* [t4+c r3 r2 r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+    c   += t4;
+    /* [c r3 r2 r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+    r[4] = c;
+    /* [r4 r3 r2 r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
+}
+
+
 
 void secp256k1_fe_mul_innerX(uint64_t *r, const uint64_t *a, const uint64_t * SECP256K1_RESTRICT b) {
     uint128_t c, d;
@@ -906,6 +1027,9 @@ void secp256k1_fe_mul_innerX(uint64_t *r, const uint64_t *a, const uint64_t * SE
     r[4] = c;
     /* [r4 r3 r2 r1 r0] = [p8 p7 p6 p5 p4 p3 p2 p1 p0] */
 }
+
+
+
 
 static void secp256k1_fe_mulX(secp256k1_feX *r, const secp256k1_feX *a, const secp256k1_feX * SECP256K1_RESTRICT b) {
 
@@ -1085,17 +1209,13 @@ static int secp256k1_fe_normalizes_to_zero_varX(secp256k1_feX *r) {
     t0 = r->n[0];
     t4 = r->n[4];
 
-    /* Reduce t4 at the start so there will be at most a single carry from the first pass */
     x = t4 >> 48;
 
-    /* The first pass ensures the magnitude is 1, ... */
     t0 += x * 0x1000003D1ULL;
 
-    /* z0 tracks a possible raw value of 0, z1 tracks a possible raw value of P */
     z0 = t0 & 0xFFFFFFFFFFFFFULL;
     z1 = z0 ^ 0x1000003D0ULL;
 
-    /* Fast return path should catch the majority of cases */
     if ((z0 != 0ULL) & (z1 != 0xFFFFFFFFFFFFFULL)) {
         return 0;
     }
@@ -1275,14 +1395,131 @@ static void secp256k1_gej_set_infinityX(secp256k1_gejX *r) {
     secp256k1_fe_clearX(&r->z);
 }
 
+/*
+static void secp256k1_gej_add_zinv_varX_GPU(secp256k1_gejX *r, const secp256k1_gejX *a, const secp256k1_geX *b, const secp256k1_feX *bzinv) {
+	secp256k1_gejX res;
+	secp256k1_gej_add_zinv_varX_CPU(&res, a, b, bzinv);
+	const int LIST_SIZE = 4;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+    fp = fopen("src/kernels.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+ 
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        sizeof(secp256k1_contextX), NULL, &ret);
+    
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        sizeof(secp256k1_ecdsa_signatureX), NULL, &ret);
+	
+	cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        32 * sizeof(char), NULL, &ret);
+    
+    cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        sizeof(secp256k1_pubkeyX), NULL, &ret);
+	
+	cl_mem e_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+                        sizeof(int), NULL, &ret);
+						
+	cl_mem f_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+                        sizeof(secp256k1_gejX), NULL, &ret);
+
+ 
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+                      sizeof(secp256k1_contextX), ctx, 0, NULL, NULL);
+	ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0,
+                      sizeof(secp256k1_ecdsa_signatureX), sig, 0, NULL, NULL);
+	ret = clEnqueueWriteBuffer(command_queue, c_mem_obj, CL_TRUE, 0,
+                      32*sizeof(char), msg32, 0, NULL, NULL);
+	ret = clEnqueueWriteBuffer(command_queue, d_mem_obj, CL_TRUE, 0,
+                      sizeof(secp256k1_pubkeyX), pubkey, 0, NULL, NULL);
+					  
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+ 
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+ 
+    cl_kernel kernel = clCreateKernel(program, "secp256k1_ecdsa_verifyX", &ret);
+ 
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
+	ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&d_mem_obj);
+	ret = clSetKernelArg(kernel, 4, sizeof(cl_mem), (void *)&e_mem_obj);
+	ret = clSetKernelArg(kernel, 5, sizeof(cl_mem), (void *)&f_mem_obj);
+ 
+    size_t global_item_size = 1; 
+    size_t local_item_size = 1; 
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    int *res = (int*)malloc(sizeof(int));
+	secp256k1_gejX *pubGPU = (secp256k1_gejX*)malloc(sizeof(secp256k1_gejX));
+	
+    ret = clEnqueueReadBuffer(command_queue, e_mem_obj, CL_TRUE, 0, 
+                        sizeof(int), res, 0, NULL, NULL);
+						
+	ret = clEnqueueReadBuffer(command_queue, f_mem_obj, CL_TRUE, 0, 
+                        sizeof(secp256k1_gejX), pubGPU, 0, NULL, NULL);
+						
+	
+	size_t log_size;
+    clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+    char *log = (char *) malloc(log_size);
+    clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
+	printf("\%s\n", log);
+	
+	ret = clFlush(command_queue);
+    ret = clFinish(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+	
+	
+}*/
+
+static void secp256k1_fe_mulX_z(secp256k1_feX *r, secp256k1_feX *a, const secp256k1_feX * SECP256K1_RESTRICT b) {
+
+	secp256k1_fe_verifyX(a);
+    secp256k1_fe_verifyX(b);
+	uint64_t rn[5];
+    secp256k1_fe_mul_innerX_z(r, a->n, b->n);
+	/*printf("\nOOO %lu", rn[0]);*/
+    r->magnitude = 1;
+    r->normalized = 0;
+}
+
+
 static void secp256k1_gej_add_zinv_varX(secp256k1_gejX *r, const secp256k1_gejX *a, const secp256k1_geX *b, const secp256k1_feX *bzinv) {
     /* 9 mul, 3 sqr, 4 normalize, 12 mul_int/add/negate */
     secp256k1_feX az, z12, u1, u2, s1, s2, h, i, i2, h2, h3, t;
-
     if (b->infinity) {
         *r = *a;
         return;
     }
+	
+	
     if (a->infinity) {
         secp256k1_feX bzinv2, bzinv3;
         r->infinity = b->infinity;
@@ -1291,18 +1528,11 @@ static void secp256k1_gej_add_zinv_varX(secp256k1_gejX *r, const secp256k1_gejX 
         secp256k1_fe_mulX(&r->x, &b->x, &bzinv2);
         secp256k1_fe_mulX(&r->y, &b->y, &bzinv3);
         secp256k1_fe_set_intX(&r->z, 1);
+		
         return;
     }
     r->infinity = 0;
 
-    /** We need to calculate (rx,ry,rz) = (ax,ay,az) + (bx,by,1/bzinv). Due to
-     *  secp256k1's isomorphism we can multiply the Z coordinates on both sides
-     *  by bzinv, and get: (rx,ry,rz*bzinv) = (ax,ay,az*bzinv) + (bx,by,1).
-     *  This means that (rx,ry,rz) can be calculated as
-     *  (ax,ay,az*bzinv) + (bx,by,1), when not applying the bzinv factor to rz.
-     *  The variable az below holds the modified Z coordinate for a, which is used
-     *  for the computation of rx and ry, but not for rz.
-     */
     secp256k1_fe_mulX(&az, &a->z, bzinv);
 
     secp256k1_fe_sqrX(&z12, &az);
@@ -1354,7 +1584,6 @@ void secp256k1_ecmult_strauss_wnafX(const secp256k1_ecmult_contextX *ctx, const 
     }
 
     if (no > 0) {
-        /* Compute the odd multiples in Jacobian form. */
         secp256k1_ecmult_odd_multiples_tableX(ECMULT_TABLE_SIZE(WINDOW_A), state->prej, state->zr, &a[state->ps[0].input_pos]);
         for (np = 1; np < no; ++np) {
             secp256k1_gejX tmp = a[state->ps[np].input_pos];
@@ -1363,7 +1592,6 @@ void secp256k1_ecmult_strauss_wnafX(const secp256k1_ecmult_contextX *ctx, const 
             secp256k1_ecmult_odd_multiples_tableX(ECMULT_TABLE_SIZE(WINDOW_A), state->prej + np * ECMULT_TABLE_SIZE(WINDOW_A), state->zr + np * ECMULT_TABLE_SIZE(WINDOW_A), &tmp);
             secp256k1_fe_mulX(state->zr + np * ECMULT_TABLE_SIZE(WINDOW_A), state->zr + np * ECMULT_TABLE_SIZE(WINDOW_A), &(a[state->ps[np].input_pos].z));
         }
-        /* Bring them to the same Z denominator. */
         secp256k1_ge_globalz_set_table_gejX(ECMULT_TABLE_SIZE(WINDOW_A) * no, state->pre_a, &Z, state->prej, state->zr);
     } else {
         secp256k1_fe_set_intX(&Z, 1);
@@ -1377,7 +1605,7 @@ void secp256k1_ecmult_strauss_wnafX(const secp256k1_ecmult_contextX *ctx, const 
     }
 
     secp256k1_gej_set_infinityX(r);
-
+	
     for (i = bits - 1; i >= 0; i--) {
         int n;
         secp256k1_gej_double_varX(r, r, NULL);
@@ -1387,10 +1615,16 @@ void secp256k1_ecmult_strauss_wnafX(const secp256k1_ecmult_contextX *ctx, const 
                 secp256k1_gej_add_ge_varX(r, r, &tmpa, NULL);
             }
         }
-        
+       
         if (i < bits_ng && (n = wnaf_ng[i])) {
+			/*printf("\ni %d ", i);
+			printf("A C x %ul ", &(*ctx->pre_g)[i].x.n[0]);
+			printf("A C y %ul ", &(*ctx->pre_g)[i].y.n[0]);*/
             ECMULT_TABLE_GET_GE_STORAGE(&tmpa, *ctx->pre_g, n, WINDOW_G);
-            secp256k1_gej_add_zinv_varX(r, r, &tmpa, &Z);
+			printf("\nA C x %ul ", tmpa.x.n[0]);
+			printf("A C y %ul \n", tmpa.y.n[0]);
+			secp256k1_gej_add_zinv_varX(r, r, &tmpa, &Z);
+			
         }
     }
     if (!r->infinity) {
@@ -1511,7 +1745,45 @@ static int secp256k1_pubkey_loadX(const secp256k1_contextX* ctx, secp256k1_geX* 
     return 1;
 }
 
-static secp256k1_gejX secp256k1_ecdsa_sig_verifyX(const secp256k1_ecmult_contextX *ctx, const secp256k1_scalarX *sigr, const secp256k1_scalarX *sigs, const secp256k1_geX *pubkey, const secp256k1_scalarX *message) {
+static int secp256k1_ecdsa_sig_verifyX(const secp256k1_ecmult_contextX *ctx, const secp256k1_scalarX *sigr, const secp256k1_scalarX *sigs, const secp256k1_geX *pubkey, const secp256k1_scalarX *message) {
+    unsigned char c[32];
+    secp256k1_scalarX sn, u1, u2;
+    secp256k1_feX xr;
+    secp256k1_gejX pubkeyj;
+    secp256k1_gejX pr;
+
+    if (secp256k1_scalar_is_zeroX(sigr) || secp256k1_scalar_is_zeroX(sigs)) {
+        return 0;
+    }
+    secp256k1_scalar_inverse_varX(&sn, sigs);
+    secp256k1_scalar_mulX(&u1, &sn, message);
+    secp256k1_scalar_mulX(&u2, &sn, sigr);
+    secp256k1_gej_set_geX(&pubkeyj, pubkey);
+    secp256k1_ecmultX(ctx, &pr, &pubkeyj, &u2, &u1);
+	printf("\nG pr %ul\n", pr.y.n[1]);
+    if (secp256k1_gej_is_infinityX(&pr)) {
+        return 0;
+    }
+	printf("\nAfter IF");
+    secp256k1_scalar_get_b32X(c, sigr);
+	printf("\nGetGet");
+    secp256k1_fe_set_b32X(&xr, c);
+	printf("\nSet %ul", xr.n[0]);
+    if (secp256k1_gej_eq_x_varX(&xr, &pr)) {
+        return 1;
+    }
+	printf("\nAfter IF2");
+    if (secp256k1_fe_cmp_varX(&xr, &secp256k1_ecdsa_const_p_minus_orderX) >= 0) {
+        return 0;
+    }
+    secp256k1_fe_addX(&xr, &secp256k1_ecdsa_const_order_as_feX);
+    if (secp256k1_gej_eq_x_varX(&xr, &pr)) {
+        return 1;
+    }
+    return 0;
+}
+
+static secp256k1_gejX secp256k1_ecdsa_sig_verifyXX(const secp256k1_ecmult_contextX *ctx, const secp256k1_scalarX *sigr, const secp256k1_scalarX *sigs, const secp256k1_geX *pubkey, const secp256k1_scalarX *message) {
     unsigned char c[32];
     secp256k1_scalarX sn, u1, u2;
     secp256k1_feX xr;
@@ -1548,6 +1820,16 @@ static secp256k1_gejX secp256k1_ecdsa_sig_verifyX(const secp256k1_ecmult_context
 
 int secp256k1_ecdsa_verifyX(const secp256k1_contextX* ctx, const secp256k1_ecdsa_signatureX *sig, const unsigned char *msg32, const secp256k1_pubkeyX *pubkey) {
 	
+	secp256k1_geX q;
+	secp256k1_gejX pubj;
+	secp256k1_scalarX r1, s1;
+    secp256k1_scalarX m;
+    secp256k1_scalar_set_b32(&m, msg32, NULL);
+    secp256k1_ecdsa_signature_load(ctx, &r1, &s1, sig);
+	return (secp256k1_pubkey_load(ctx, &q, pubkey) && secp256k1_ecdsa_sig_verifyX(&ctx->ecmult_ctx, &r1, &s1, &q, &m));
+
+	
+	/*
 	const int LIST_SIZE = 4;
     FILE *fp;
     char *source_str;
@@ -1615,19 +1897,14 @@ int secp256k1_ecdsa_verifyX(const secp256k1_contextX* ctx, const secp256k1_ecdsa
 	ret = clSetKernelArg(kernel, 4, sizeof(cl_mem), (void *)&e_mem_obj);
 	ret = clSetKernelArg(kernel, 5, sizeof(cl_mem), (void *)&f_mem_obj);
  
-    size_t global_item_size = LIST_SIZE; 
+    size_t global_item_size = 1; 
     size_t local_item_size = 1; 
     ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, 
             &global_item_size, &local_item_size, 0, NULL, NULL);
  
     int *res = (int*)malloc(sizeof(int));
-	secp256k1_gejX *pubGPU = (secp256k1_gejX*)malloc(sizeof(secp256k1_gejX));
-	
     ret = clEnqueueReadBuffer(command_queue, e_mem_obj, CL_TRUE, 0, 
                         sizeof(int), res, 0, NULL, NULL);
-						
-	ret = clEnqueueReadBuffer(command_queue, f_mem_obj, CL_TRUE, 0, 
-                        sizeof(secp256k1_gejX), pubGPU, 0, NULL, NULL);
 						
 	
 	size_t log_size;
@@ -1636,67 +1913,18 @@ int secp256k1_ecdsa_verifyX(const secp256k1_contextX* ctx, const secp256k1_ecdsa
     clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
 	printf("\%s\n", log);
 	
-	printf("\n1 ? %d \n", *res);/*
-	int k;
-	for(k=0;k<4;k++)
-		printf("%d ",scalR->d[k]);
-	printf("\n");
-	for(k=0;k<4;k++)
-		printf("%d ",scalS->d[k]);*/
-	
 	secp256k1_geX q;
 	secp256k1_gejX pubj;
 	secp256k1_scalarX r1, s1;
     secp256k1_scalarX m;
-    secp256k1_scalar_set_b32X(&m, msg32, NULL);
-    secp256k1_ecdsa_signature_loadX(ctx, &r1, &s1, sig);
-	secp256k1_pubkey_loadX(ctx, &q, pubkey);
-	pubj = secp256k1_ecdsa_sig_verifyX(&ctx->ecmult_ctx,&r1,&s1,&q,&m);
+    secp256k1_scalar_set_b32(&m, msg32, NULL);
+    secp256k1_ecdsa_signature_load(ctx, &r1, &s1, sig);
+	int tmp = (secp256k1_pubkey_load(ctx, &q, pubkey) && secp256k1_ecdsa_sig_verifyX(&ctx->ecmult_ctx, &r1, &s1, &q, &m));
 
+	printf("\nresults: %d %d\n", tmp, *res);
 	
-	
-	int k;
-
-	for(k=0;k<5;k++)
-		if(pubGPU->x.n[k] != pubj.x.n[k])
-			printf("BAD J\n");
-		
-	for(k=0;k<5;k++)
-		if(pubGPU->y.n[k] != pubj.y.n[k])
-			printf("BAD J\n");
-		
-	for(k=0;k<5;k++)
-		if(pubGPU->z.n[k] != pubj.z.n[k])
-			printf("BAD J\n");
-	
-	printf("\npubj CPU\nX\n");
-	for(k=0;k<5;k++)
-		printf("%d ", pubj.x.n[k]);
-	
-	printf("\nGPU X\n");
-	for(k=0;k<5;k++)
-		printf("%d ", pubGPU->x.n[k]);
-	
-	printf("\n\nCPU Y\n");
-	for(k=0;k<5;k++)
-		printf("%d ", pubj.y.n[k]);
-	
-	printf("\nGPU Y\n");
-	for(k=0;k<5;k++)
-		printf("%d ", pubGPU->y.n[k]);
-	
-	printf("\n\nCPU Z\n");
-	for(k=0;k<5;k++)
-		printf("%d ", pubj.z.n[k]);
-	
-	printf("\nGPU Z\n");
-	for(k=0;k<5;k++)
-		printf("%d ", pubGPU->z.n[k]);
-	
-	printf("\nINFINITY\n%d ", pubGPU->infinity);
-	printf("\n%d ", pubj.infinity);
-	
-	printf("\n\n");
+	char c;
+	scanf("%c", &c);
     ret = clFlush(command_queue);
     ret = clFinish(command_queue);
     ret = clReleaseKernel(kernel);
@@ -1705,8 +1933,135 @@ int secp256k1_ecdsa_verifyX(const secp256k1_contextX* ctx, const secp256k1_ecdsa
     ret = clReleaseMemObject(b_mem_obj);
     ret = clReleaseCommandQueue(command_queue);
     ret = clReleaseContext(context);
+	*/
+	return 1;
 }
 
+
+
+
+int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_signatureX *sig, const unsigned char *msg32, const secp256k1_pubkeyX *pubkey) {
+	
+	const int LIST_SIZE = 10000;
+    FILE *fp;
+    char *source_str;
+    size_t source_size;
+    fp = fopen("src/k.cl", "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to load kernel.\n");
+        exit(1);
+    }
+    source_str = (char*)malloc(MAX_SOURCE_SIZE);
+    source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
+    fclose( fp );
+	
+    cl_platform_id platform_id = NULL;
+    cl_device_id device_id = NULL;   
+    cl_uint ret_num_devices;
+    cl_uint ret_num_platforms;
+    cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
+    ret = clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, 
+            &device_id, &ret_num_devices);
+ 
+	secp256k1_ge_storageX* arr = (secp256k1_ge_storageX*)malloc(8192*sizeof(secp256k1_ge_storageX));
+	int idx, nnn;
+	for(idx = 0; idx < 8192; idx++ )
+	{
+		for(nnn = 0; nnn < 4; nnn++ )
+		{
+			arr[idx].x.n[nnn] = (*ctx->ecmult_ctx.pre_g)[idx].x.n[nnn];
+			arr[idx].y.n[nnn] = (*ctx->ecmult_ctx.pre_g)[idx].y.n[nnn];
+		}
+	}
+	
+	printf("\nHey Hey %ul", &(*ctx->ecmult_ctx.pre_g)[200].x.n[1]);
+	printf("\nHey Hey %ul\n", arr[200].x.n[1]);
+
+
+    cl_context context = clCreateContext( NULL, 1, &device_id, NULL, NULL, &ret);
+ 
+    cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
+ 
+    cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        8192*sizeof(secp256k1_ge_storageX), NULL, &ret);
+    
+    cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        LIST_SIZE*sizeof(secp256k1_ecdsa_signatureX), NULL, &ret);
+	
+	cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        32 * sizeof(char), NULL, &ret);
+    
+    cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+                        sizeof(secp256k1_pubkeyX), NULL, &ret);
+	cl_mem e_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
+                        LIST_SIZE*sizeof(int), NULL, &ret);
+						
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0,
+                      8192*sizeof(secp256k1_ge_storageX), arr, 0, NULL, NULL);
+	ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0,
+                      LIST_SIZE*sizeof(secp256k1_ecdsa_signatureX), sig, 0, NULL, NULL); 
+	ret = clEnqueueWriteBuffer(command_queue, c_mem_obj, CL_TRUE, 0,
+                      32*sizeof(char), msg32, 0, NULL, NULL);
+	ret = clEnqueueWriteBuffer(command_queue, d_mem_obj, CL_TRUE, 0,
+                      sizeof(secp256k1_pubkeyX), pubkey, 0, NULL, NULL);
+			  
+    cl_program program = clCreateProgramWithSource(context, 1, 
+            (const char **)&source_str, (const size_t *)&source_size, &ret);
+	
+    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+ 
+    cl_kernel kernel = clCreateKernel(program, "secp256k1_ecdsa_verifyX", &ret);
+    /*printf("\nHey All\n");
+    */ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
+	ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&d_mem_obj);
+	ret = clSetKernelArg(kernel, 4, sizeof(cl_mem), (void *)&e_mem_obj);
+ 
+    size_t global_item_size = LIST_SIZE; 
+    size_t local_item_size = 1;
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL,
+            &global_item_size, &local_item_size, 0, NULL, NULL);
+ 
+    int *res = (int*)malloc(LIST_SIZE*sizeof(int));
+    ret = clEnqueueReadBuffer(command_queue, e_mem_obj, CL_TRUE, 0, 
+                        LIST_SIZE*sizeof(int), res, 0, NULL, NULL);
+						
+	
+	size_t log_size;
+    clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+    char *log = (char *) malloc(log_size);
+    clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
+	printf("\%s\n", log);
+	
+	secp256k1_geX q;
+	secp256k1_gejX pubj;
+	secp256k1_scalarX r1, s1;
+    secp256k1_scalarX m;
+    secp256k1_scalar_set_b32(&m, msg32, NULL);
+    secp256k1_ecdsa_signature_load(ctx, &r1, &s1, sig);
+	int tmp = (secp256k1_pubkey_load(ctx, &q, pubkey) && secp256k1_ecdsa_sig_verifyX(&ctx->ecmult_ctx, &r1, &s1, &q, &m));
+	
+	int k;
+	printf("\nn C G\n");
+	for(k=0;k<LIST_SIZE;k++)
+	{
+		printf("%d ", k);
+		printf("%d %d\n", tmp, res[k]);
+	}
+	
+	char c;
+	/*scanf("%c", &c);*/
+    ret = clFlush(command_queue);
+    ret = clReleaseKernel(kernel);
+    ret = clReleaseProgram(program);
+    ret = clReleaseMemObject(a_mem_obj);
+    ret = clReleaseMemObject(b_mem_obj);
+    ret = clReleaseCommandQueue(command_queue);
+    ret = clReleaseContext(context);
+	
+	return 1;
+}
 
 
 
@@ -3922,7 +4277,8 @@ void test_ecdsa_end_to_end(void) {
     unsigned char privkey[32];
     unsigned char message[32];
     unsigned char privkey2[32];
-    secp256k1_ecdsa_signature signature[5];
+	int s = 10000;
+    secp256k1_ecdsa_signature *signature = malloc(s*sizeof(secp256k1_ecdsa_signature));
     unsigned char sig[74];
     size_t siglen = 74;
     unsigned char pubkeyc[65];
@@ -3989,38 +4345,64 @@ void test_ecdsa_end_to_end(void) {
     }
 
     /* Sign. */
-    CHECK(secp256k1_ecdsa_sign(ctx, &signature[0], message, privkey, NULL, NULL) == 1);
-    CHECK(secp256k1_ecdsa_sign(ctx, &signature[4], message, privkey, NULL, NULL) == 1);
-    CHECK(secp256k1_ecdsa_sign(ctx, &signature[1], message, privkey, NULL, extra) == 1);
-    extra[31] = 1;
-    CHECK(secp256k1_ecdsa_sign(ctx, &signature[2], message, privkey, NULL, extra) == 1);
-    extra[31] = 0;
-    extra[0] = 1;
-    CHECK(secp256k1_ecdsa_sign(ctx, &signature[3], message, privkey, NULL, extra) == 1);
-    CHECK(memcmp(&signature[0], &signature[4], sizeof(signature[0])) == 0);
+    
+    /*CHECK(memcmp(&signature[0], &signature[4], sizeof(signature[0])) == 0);
     CHECK(memcmp(&signature[0], &signature[1], sizeof(signature[0])) != 0);
     CHECK(memcmp(&signature[0], &signature[2], sizeof(signature[0])) != 0);
     CHECK(memcmp(&signature[0], &signature[3], sizeof(signature[0])) != 0);
     CHECK(memcmp(&signature[1], &signature[2], sizeof(signature[0])) != 0);
     CHECK(memcmp(&signature[1], &signature[3], sizeof(signature[0])) != 0);
-    CHECK(memcmp(&signature[2], &signature[3], sizeof(signature[0])) != 0);
+    CHECK(memcmp(&signature[2], &signature[3], sizeof(signature[0])) != 0);*/
     /* Verify. */
-    CHECK(secp256k1_ecdsa_verifyX(ctx, &signature[0], message, &pubkey) == 1);
-    CHECK(secp256k1_ecdsa_verifyX(ctx, &signature[1], message, &pubkey) == 1);
-    CHECK(secp256k1_ecdsa_verifyX(ctx, &signature[2], message, &pubkey) == 1);
-    CHECK(secp256k1_ecdsa_verifyX(ctx, &signature[3], message, &pubkey) == 1);
+	
+	int a;
+	for(a=0;a<s;a++)
+		secp256k1_ecdsa_sign(ctx, &signature[a], message, privkey, NULL, extra);
+	
+	char c;
+	printf("\nto start press ENTER\n");
+	/*scanf("%c", &c);*/
+	clock_t t; 
+    t = clock();
+	
+	secp256k1_ecdsa_verify_arr(ctx, signature, message, &pubkey);
+	
+	t = clock() - t; 
+    double time_taken = ((double)t)/CLOCKS_PER_SEC;
+	printf("%d verify took %f seconds to execute \n",s, time_taken); 
+	
+	/*scanf("%c", &c);*/
+	
+	/*clock_t t; 
+    t = clock();
+	int a;
+	for(a=0;a<1000000;a++)
+	{
+	CHECK(secp256k1_ecdsa_verify(ctx, &signature[0], message, &pubkey) == 1);
+	CHECK(secp256k1_ecdsa_verify(ctx, &signature[0], message, &pubkey) == 1);
+    CHECK(secp256k1_ecdsa_verify(ctx, &signature[1], message, &pubkey) == 1);
+    CHECK(secp256k1_ecdsa_verify(ctx, &signature[2], message, &pubkey) == 1);
+    CHECK(secp256k1_ecdsa_verify(ctx, &signature[3], message, &pubkey) == 1);
+	CHECK(secp256k1_ecdsa_verify(ctx, &signature[0], message, &pubkey) == 1);
+	CHECK(secp256k1_ecdsa_verify(ctx, &signature[0], message, &pubkey) == 1);
+    CHECK(secp256k1_ecdsa_verify(ctx, &signature[1], message, &pubkey) == 1);
+    CHECK(secp256k1_ecdsa_verify(ctx, &signature[2], message, &pubkey) == 1);
+    CHECK(secp256k1_ecdsa_verify(ctx, &signature[3], message, &pubkey) == 1);
+	}
+	t = clock() - t; 
+    double time_taken = ((double)t)/CLOCKS_PER_SEC;
+	printf("10,000,000 verify took %f seconds to execute \n", time_taken); */
 
+	
     /* Serialize/parse DER and verify again */
     CHECK(secp256k1_ecdsa_signature_serialize_der(ctx, sig, &siglen, &signature[0]) == 1);
     memset(&signature[0], 0, sizeof(signature[0]));
     CHECK(secp256k1_ecdsa_signature_parse_der(ctx, &signature[0], sig, siglen) == 1);
-    CHECK(secp256k1_ecdsa_verifyX(ctx, &signature[0], message, &pubkey) == 1);
-    /* Serialize/destroy/parse DER and verify again. */
+    /*CHECK(secp256k1_ecdsa_verifyX(ctx, &signature[0], message, &pubkey) == 1);
+     Serialize/destroy/parse DER and verify again. */
     siglen = 74;
     CHECK(secp256k1_ecdsa_signature_serialize_der(ctx, sig, &siglen, &signature[0]) == 1);
     sig[secp256k1_rand32() % siglen] += 1 + (secp256k1_rand32() % 255);
-    CHECK(secp256k1_ecdsa_signature_parse_der(ctx, &signature[0], sig, siglen) == 0 ||
-          secp256k1_ecdsa_verifyX(ctx, &signature[0], message, &pubkey) == 0);
 }
 
 void test_random_pubkeys(void) {
@@ -4097,9 +4479,10 @@ void run_random_pubkeys(void) {
 
 void run_ecdsa_end_to_end(void) {
     int i;
-    for (i = 0; i < 64*count; i++) {
+	test_ecdsa_end_to_end();
+    /*for (i = 0; i < 64*count; i++) {
         test_ecdsa_end_to_end();
-    }
+    }*/
 }
 
 /* Tests several edge cases. */
@@ -4393,15 +4776,15 @@ int main(int argc, char **argv) {
 
     /* endomorphism tests */
 #ifdef USE_ENDOMORPHISM
-    run_endomorphism_tests();
+    /*run_endomorphism_tests();*/
 #endif
 
     /* EC point parser test*/
-    run_ec_pubkey_parse_test();
+    /*run_ec_pubkey_parse_test();*/
 
 #ifdef ENABLE_MODULE_ECDH
     /* ecdh tests */
-    run_ecdh_tests();
+    /*run_ecdh_tests();*/
 #endif
 
     /* ecdsa tests */
