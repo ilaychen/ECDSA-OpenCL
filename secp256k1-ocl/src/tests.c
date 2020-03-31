@@ -2039,11 +2039,11 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
 	printf("\n# CPU GPU\n");
 	for(k=0;k<LIST_SIZE;k++)
 	{
-		printf("%d ", k);
-		printf(" %d   %d\n", tmp, res[k]);
+		printf("\n%d ", k);
+		printf(" %d   %d", tmp, res[k]);
 	}
 	printf("\n# CPU GPU\n");
-	
+	printf("--------------\n");
 	char c;
 	/*scanf("%c", &c);*/
     ret = clFlush(command_queue);
