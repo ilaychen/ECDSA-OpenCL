@@ -11,16 +11,12 @@ To compile it:
 
 1.Download the Git directory.
 
-2.Go inside the secp256k1-latest directory and run:
 
+2.Go inside the secp256k1-latest :
 
-make
+libsecp256k1 is built using autotools:
 
-
-To run it, simply write:
-
-./tests
-
+$ ./autogen.sh $ ./configure $ make $ ./tests $ sudo make install # optional
 
 
 STATUS: In a near futur, we're going to integrate this library to the Bitcoin-Core and test it.
