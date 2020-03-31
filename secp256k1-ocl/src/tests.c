@@ -2036,12 +2036,13 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
 	int tmp = (secp256k1_pubkey_load(ctx, &q, pubkey) && secp256k1_ecdsa_sig_verifyX(&ctx->ecmult_ctx, &r1, &s1, &q, &m));
 	
 	int k;
-	printf("\nn CPU GPU\n");
+	printf("\n# CPU GPU\n");
 	for(k=0;k<LIST_SIZE;k++)
 	{
 		printf("%d ", k);
 		printf(" %d   %d\n", tmp, res[k]);
 	}
+	printf("\n# CPU GPU\n");
 	
 	char c;
 	/*scanf("%c", &c);*/
