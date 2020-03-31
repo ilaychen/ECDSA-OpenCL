@@ -1,11 +1,22 @@
 # ECDSA-OpenCL
 
-Work in progress...
+This library is a fork of Sipa's Secp256k1 library, currently in use for Bitcoin.
+The changes we made here is that we took the signature verification unit and re-wrote it in OpenCL in order for it to be run on a GPU and thus to accelerate signature verification for a Bitcoin block.
+The choice of OpenCL as a programming language was to have it run on a wider range of GPUs (unlike with company-owned programming language for GPUs).
 
-secp256k1-opencl is the bitcoin-core's lib for ECDSA with our changes - we've converted some of the signature verification functions into OpenCL and integrated them with the original lib's tests.
+We've tested this library and in our environment it has a better throughput than with a CPU from a little less than 2000 signatures.
+We've mainly changed verify_first/src/tests.c and we've created verify_first/src/k.cl 
 
-bit_cl is an extracted code of the secp256k1 lib for the signature verification routine. A few functions of the code were implemented in OpenCL and have been softly tested.
+To compile it:
+1.Download the Git directory.
+2. Go inside the verify_first directory and run:
 
-deprecated is the first simple ECDSA C code with an implementation in OpenCL
+make
+To run it, simply write:
 
-STATUS: we're implementing and debugging the OpenCL code and the integration with the original secp256k1 lib.
+./tests
+
+
+
+STATUS: Done.
+Copyright Ilay Chen & Yakir Fenton, March 30th 2020.
