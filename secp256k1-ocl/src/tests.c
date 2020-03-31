@@ -10,6 +10,9 @@
 #endif
 #include <stdint.h>
 
+
+#define NUM_OF_SIGS 100000
+
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
 #else
@@ -1932,7 +1935,7 @@ int secp256k1_ecdsa_verifyX(const secp256k1_contextX* ctx, const secp256k1_ecdsa
 
 int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_signatureX *sig, const unsigned char *msg32, const secp256k1_pubkeyX *pubkey) {
 	
-	const int LIST_SIZE = 1;
+	const int LIST_SIZE = NUM_OF_SIGS;
     FILE *fp;
     char *source_str;
     size_t source_size;
@@ -1998,8 +2001,7 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
     ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
  
     cl_kernel kernel = clCreateKernel(program, "secp256k1_ecdsa_verifyX", &ret);
-    /*printf("\nHey All\n");
-    */ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&a_mem_obj);
     ret = clSetKernelArg(kernel, 1, sizeof(cl_mem), (void *)&b_mem_obj);
 	ret = clSetKernelArg(kernel, 2, sizeof(cl_mem), (void *)&c_mem_obj);
     ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&d_mem_obj);
@@ -2007,6 +2009,10 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
  
     size_t global_item_size = LIST_SIZE; 
     size_t local_item_size = 1;
+	if(LIST_SIZE > 100)
+	{
+		local_item_size = 40;
+	}
     ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL,
             &global_item_size, &local_item_size, 0, NULL, NULL);
  
@@ -2030,11 +2036,11 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
 	int tmp = (secp256k1_pubkey_load(ctx, &q, pubkey) && secp256k1_ecdsa_sig_verifyX(&ctx->ecmult_ctx, &r1, &s1, &q, &m));
 	
 	int k;
-	printf("\nn C G\n");
+	printf("\nn CPU GPU\n");
 	for(k=0;k<LIST_SIZE;k++)
 	{
 		printf("%d ", k);
-		printf("%d %d\n", tmp, res[k]);
+		printf(" %d   %d\n", tmp, res[k]);
 	}
 	
 	char c;
@@ -4264,7 +4270,7 @@ void test_ecdsa_end_to_end(void) {
     unsigned char privkey[32];
     unsigned char message[32];
     unsigned char privkey2[32];
-	int s = 1;
+	int s = NUM_OF_SIGS;
     secp256k1_ecdsa_signature *signature = malloc(s*sizeof(secp256k1_ecdsa_signature));
     unsigned char sig[74];
     size_t siglen = 74;
@@ -4347,12 +4353,8 @@ void test_ecdsa_end_to_end(void) {
 		secp256k1_ecdsa_sign(ctx, &signature[a], message, privkey, NULL, extra);
 	
 	char c;
-	printf("\nto start press ENTER\n");
-	/*scanf("%c", &c);*/
 	clock_t t; 
     t = clock();
-	/*pubkey.data[5] = 5;
-	pubkey.data[4] = 5;*/
 	secp256k1_ecdsa_verify_arr(ctx, signature, message, &pubkey);
 	
 	t = clock() - t; 
