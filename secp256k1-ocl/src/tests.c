@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 
-#define NUM_OF_SIGS 100000
+#define NUM_OF_SIGS 1000
 
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -2039,7 +2039,7 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
 	printf("\n# CPU GPU\n");
 	for(k=0;k<LIST_SIZE;k++)
 	{
-		printf("\n%d ", k);
+		printf("\n%d ", k+1);
 		printf(" %d   %d", tmp, res[k]);
 	}
 	printf("\n# CPU GPU\n");
