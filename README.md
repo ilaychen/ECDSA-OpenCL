@@ -11,7 +11,7 @@ To compile it:
 
 1.Download the Git directory.
 
-2. Go inside the verify_first directory and run:
+2.Go inside the verify_first directory and run:
 
 
 make
