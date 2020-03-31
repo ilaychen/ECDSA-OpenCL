@@ -17,7 +17,6 @@ To compile it:
 
 libsecp256k1 is built using autotools:
 
-`./sudo`  
 ``` sh
 chmod u+x *
 ./autogen.sh 
