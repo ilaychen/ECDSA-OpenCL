@@ -30,7 +30,7 @@ sudo make install # optional
 To change the number of signatures that are beig verified, modify in `secp256k1-ocl/src/test.c` the `NUM_OF_SIGS` Define.
 
 ### Results
-for 100,000+ signatures our code is x25 faster
+for 100,000+ signatures the GPU run is x25 faster than the CPU run
 
 STATUS: In a near futur, we're going to integrate this library to the Bitcoin-Core and test it.
 
