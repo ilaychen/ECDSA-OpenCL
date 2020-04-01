@@ -437,7 +437,7 @@ Copyright (C) 2012 Free Software Foundation, Inc.
 This config.status script is free software; the Free Software Foundation
 gives unlimited permission to copy, distribute and modify it."
 
-ac_pwd='/tmp/project/mobaaaaaa/verify_first'
+ac_pwd='/tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl'
 srcdir='.'
 INSTALL='/usr/bin/install -c'
 MKDIR_P='/bin/mkdir -p'
@@ -906,12 +906,12 @@ S["mkdir_p"]="$(MKDIR_P)"
 S["MKDIR_P"]="/bin/mkdir -p"
 S["INSTALL_STRIP_PROGRAM"]="$(install_sh) -c -s"
 S["STRIP"]="/usr/bin/strip"
-S["install_sh"]="${SHELL} /tmp/project/mobaaaaaa/verify_first/build-aux/install-sh"
-S["MAKEINFO"]="${SHELL} /tmp/project/mobaaaaaa/verify_first/build-aux/missing makeinfo"
-S["AUTOHEADER"]="${SHELL} /tmp/project/mobaaaaaa/verify_first/build-aux/missing autoheader"
-S["AUTOMAKE"]="${SHELL} /tmp/project/mobaaaaaa/verify_first/build-aux/missing automake-1.15"
-S["AUTOCONF"]="${SHELL} /tmp/project/mobaaaaaa/verify_first/build-aux/missing autoconf"
-S["ACLOCAL"]="${SHELL} /tmp/project/mobaaaaaa/verify_first/build-aux/missing aclocal-1.15"
+S["install_sh"]="${SHELL} /tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl/build-aux/install-sh"
+S["MAKEINFO"]="${SHELL} /tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl/build-aux/missing makeinfo"
+S["AUTOHEADER"]="${SHELL} /tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl/build-aux/missing autoheader"
+S["AUTOMAKE"]="${SHELL} /tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl/build-aux/missing automake-1.15"
+S["AUTOCONF"]="${SHELL} /tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl/build-aux/missing autoconf"
+S["ACLOCAL"]="${SHELL} /tmp/project/iiiii/rrr/ECDSA-OpenCL/secp256k1-ocl/build-aux/missing aclocal-1.15"
 S["VERSION"]="0.1"
 S["PACKAGE"]="libsecp256k1"
 S["CYGPATH_W"]="echo"
