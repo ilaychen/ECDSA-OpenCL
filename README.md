@@ -13,7 +13,7 @@ To compile it:
 1.Clone the Git directory.
 
 
-2.Go inside /secp256k1-ocl :
+2.Go inside `secp256k1-ocl/` dir :
 
 run
 
@@ -23,7 +23,6 @@ chmod u+x *
 ./configure
 make
 ./tests
-sudo make install # optional
 ```
 
 ### 
