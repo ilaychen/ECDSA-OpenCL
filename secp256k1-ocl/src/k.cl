@@ -1715,7 +1715,6 @@ __kernel void secp256k1_ecdsa_verifyX(__global const secp256k1_ge_storageX* ctx,
     secp256k1_scalar_set_b32X(&m, msg32, NULL);
 	
     secp256k1_ecdsa_signature_loadX(ctx, &r, &s, &sig[get_global_id(0)]);
-	int load_res = secp256k1_pubkey_loadX(ctx, &q, pubkey);
-	int tmp = (secp256k1_pubkey_loadX(ctx, &q, pubkey) && secp256k1_ecdsa_sig_verifyX(ctx, &r, &s, &q, &m));
+	int tmp = (secp256k1_pubkey_loadX(ctx, &q, &pubkey[get_global_id(0)]) && secp256k1_ecdsa_sig_verifyX(ctx, &r, &s, &q, &m));
 	res[get_global_id(0)] = tmp;
 }

@@ -1982,7 +1982,7 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
                         32 * sizeof(char), NULL, &ret);
     
     cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY, 
-                        sizeof(secp256k1_pubkeyX), NULL, &ret);
+                        LIST_SIZE*sizeof(secp256k1_pubkeyX), NULL, &ret);
 	cl_mem e_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY, 
                         LIST_SIZE*sizeof(int), NULL, &ret);
 						
@@ -1993,7 +1993,7 @@ int secp256k1_ecdsa_verify_arr(const secp256k1_contextX* ctx, secp256k1_ecdsa_si
 	ret = clEnqueueWriteBuffer(command_queue, c_mem_obj, CL_TRUE, 0,
                       32*sizeof(char), msg32, 0, NULL, NULL);
 	ret = clEnqueueWriteBuffer(command_queue, d_mem_obj, CL_TRUE, 0,
-                      sizeof(secp256k1_pubkeyX), pubkey, 0, NULL, NULL);
+                      LIST_SIZE*sizeof(secp256k1_pubkeyX), pubkey, 0, NULL, NULL);
 			  
     cl_program program = clCreateProgramWithSource(context, 1, 
             (const char **)&source_str, (const size_t *)&source_size, &ret);
@@ -4273,6 +4273,7 @@ void test_ecdsa_end_to_end(void) {
     unsigned char privkey2[32];
 	int s = NUM_OF_SIGS;
     secp256k1_ecdsa_signature *signature = malloc(s*sizeof(secp256k1_ecdsa_signature));
+	secp256k1_pubkey *pubkey_ = malloc(s*sizeof(secp256k1_pubkey));
     unsigned char sig[74];
     size_t siglen = 74;
     unsigned char pubkeyc[65];
@@ -4281,7 +4282,6 @@ void test_ecdsa_end_to_end(void) {
     unsigned char seckey[300];
     size_t seckeylen = 300;
 
-    /* Generate a random key and message. */
     {
         secp256k1_scalar msg, key;
         random_scalar_order_test(&msg);
@@ -4289,74 +4289,23 @@ void test_ecdsa_end_to_end(void) {
         secp256k1_scalar_get_b32(privkey, &key);
         secp256k1_scalar_get_b32(message, &msg);
     }
+	int j;
+	for(j=0;j<s;j++)
+		CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey_[j], privkey) == 1);
+	CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey, privkey) == 1);
+	CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey_[0], privkey) == 1);
 
-    /* Construct and verify corresponding public key. */
-    CHECK(secp256k1_ec_seckey_verify(ctx, privkey) == 1);
-    CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey, privkey) == 1);
-
-    /* Verify exporting and importing public key. */
-    CHECK(secp256k1_ec_pubkey_serialize(ctx, pubkeyc, &pubkeyclen, &pubkey, secp256k1_rand32() % 2) == 1);
-    memset(&pubkey, 0, sizeof(pubkey));
-    CHECK(secp256k1_ec_pubkey_parse(ctx, &pubkey, pubkeyc, pubkeyclen) == 1);
-
-    /* Verify private key import and export. */
-    CHECK(secp256k1_ec_privkey_export(ctx, seckey, &seckeylen, privkey, (secp256k1_rand32() % 2) == 1) ? SECP256K1_EC_COMPRESSED : 0);
-    CHECK(secp256k1_ec_privkey_import(ctx, privkey2, seckey, seckeylen) == 1);
-    CHECK(memcmp(privkey, privkey2, 32) == 0);
-
-    /* Optionally tweak the keys using addition. */
-    if (secp256k1_rand32() % 3 == 0) {
-        int ret1;
-        int ret2;
-        unsigned char rnd[32];
-        secp256k1_pubkey pubkey2;
-        secp256k1_rand256_test(rnd);
-        ret1 = secp256k1_ec_privkey_tweak_add(ctx, privkey, rnd);
-        ret2 = secp256k1_ec_pubkey_tweak_add(ctx, &pubkey, rnd);
-        CHECK(ret1 == ret2);
-        if (ret1 == 0) {
-            return;
-        }
-        CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey2, privkey) == 1);
-        CHECK(memcmp(&pubkey, &pubkey2, sizeof(pubkey)) == 0);
-    }
-
-    /* Optionally tweak the keys using multiplication. */
-    if (secp256k1_rand32() % 3 == 0) {
-        int ret1;
-        int ret2;
-        unsigned char rnd[32];
-        secp256k1_pubkey pubkey2;
-        secp256k1_rand256_test(rnd);
-        ret1 = secp256k1_ec_privkey_tweak_mul(ctx, privkey, rnd);
-        ret2 = secp256k1_ec_pubkey_tweak_mul(ctx, &pubkey, rnd);
-        CHECK(ret1 == ret2);
-        if (ret1 == 0) {
-            return;
-        }
-        CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey2, privkey) == 1);
-        CHECK(memcmp(&pubkey, &pubkey2, sizeof(pubkey)) == 0);
-    }
-
-    /* Sign. */
-    
-    /*CHECK(memcmp(&signature[0], &signature[4], sizeof(signature[0])) == 0);
-    CHECK(memcmp(&signature[0], &signature[1], sizeof(signature[0])) != 0);
-    CHECK(memcmp(&signature[0], &signature[2], sizeof(signature[0])) != 0);
-    CHECK(memcmp(&signature[0], &signature[3], sizeof(signature[0])) != 0);
-    CHECK(memcmp(&signature[1], &signature[2], sizeof(signature[0])) != 0);
-    CHECK(memcmp(&signature[1], &signature[3], sizeof(signature[0])) != 0);
-    CHECK(memcmp(&signature[2], &signature[3], sizeof(signature[0])) != 0);*/
-    /* Verify. */
-	
 	int a;
 	for(a=0;a<s;a++)
+	{
+		CHECK(secp256k1_ec_pubkey_create(ctx, &pubkey_[a], privkey) == 1);
 		secp256k1_ecdsa_sign(ctx, &signature[a], message, privkey, NULL, extra);
+	}
 	
 	char c;
 	clock_t t; 
     t = clock();
-	secp256k1_ecdsa_verify_arr(ctx, signature, message, &pubkey);
+	secp256k1_ecdsa_verify_arr(ctx, signature, message, pubkey_);
 	
 	t = clock() - t; 
     double time_taken = ((double)t)/CLOCKS_PER_SEC;
