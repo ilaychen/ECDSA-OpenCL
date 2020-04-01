@@ -36,7 +36,7 @@ And then, run:
 
 `ldconfig`
 
-### 
+### Signatures Number
 To change the number of signatures that are beig verified, modify in `secp256k1-ocl/src/test.c` the `NUM_OF_SIGS` Define.
 
 ### Results
