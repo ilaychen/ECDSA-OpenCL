@@ -31,7 +31,7 @@ To change the number of signatures that are beig verified, modify in `secp256k1-
 ### Results
 for 100,000+ signatures the GPU run is x25 faster than the CPU run
 
-STATUS: In a near futur, we're going to integrate this library to the Bitcoin-Core and test it.
+STATUS: In a near futur, we're going to integrate this library to the Bitcoin-Core.
 
 ## Copyright
 Copyright Ilay Chen & Yakir Fenton, March 30th 2020.
