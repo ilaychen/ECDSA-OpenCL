@@ -24,8 +24,19 @@ chmod u+x *
 make
 ./tests
 ```
+### Set OpenCL Environment 
+On Linux, in order to set an OpenCL environment, if you haven't done so before, you must run the following steps:
+``` sh
+export PATH=/usr/local/cuda/bin${PATH:+:${PATH}}
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/cuda/lib64
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/lib:$LD_LIBRARY_PATH
+export C_INCLUDE_PATH=/usr/local/cuda/include
+```
+And then, run:
 
-### 
+`ldconfig`
+
+### Signatures Number
 To change the number of signatures that are beig verified, modify in `secp256k1-ocl/src/test.c` the `NUM_OF_SIGS` Define.
 
 ### Results
